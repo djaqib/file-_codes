@@ -1,42 +1,45 @@
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes, ConversationHandler
 
 import db
-from utils import restricted, parse_duration
+from utils import restricted, parse_duration, back_to_menu_keyboard
 
-MAIN_MENU_TEXT = (
-    "\U0001F47B *GHOST'S STORAGE*\n\n"
-    "Your private Telegram cloud drive.\n\n"
-    "/create \u2013 start a new storage session\n"
-    "/stop \u2013 finish the active session\n"
-    "/open <code> \u2013 retrieve a collection\n"
-    "/list \u2013 your sessions\n"
-    "/help \u2013 all commands"
+MAIN_MENU_CARD_TEXT = (
+    "\U0001F47B *GHOST'S STORAGE*\n"
+    "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+    "Hey *{name}* \u2014 your files, stored forever, even if this bot disappears.\n\n"
+    "Pick an option below \u2193"
 )
 
-# Persistent button menu shown under the chat input, matching the
-# reference bot's layout (2 buttons per row).
-MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["\U0001F4E5 New Upload", "\U0001F4C1 My Cloud"],
-        ["\U0001F464 Profile", "\U0001F511 Open Code"],
-        ["\u2699\ufe0f Settings", "\u2753 Help"],
-    ],
-    resize_keyboard=True,
-)
+# Conversation states for the /create name+description flow.
+NAME, DESC = range(2)
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001F4E5 New Upload", callback_data="menu:upload"),
+         InlineKeyboardButton("\U0001F4C1 My Cloud", callback_data="menu:cloud")],
+        [InlineKeyboardButton("\U0001F464 Profile", callback_data="menu:profile"),
+         InlineKeyboardButton("\U0001F511 Open Code", callback_data="menu:opencode")],
+        [InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="menu:settings"),
+         InlineKeyboardButton("\u2753 Help", callback_data="menu:help")],
+    ])
 
 
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Deep link support: tapping a t.me/yourbot?start=CODE link (e.g. from
-    # a /share card) arrives here with the code as context.args[0].
+    # a share card) arrives here with the code as context.args[0].
     if context.args:
         from items import send_share_card
         await send_share_card(update, context, context.args[0])
         return
 
-    await update.message.reply_text(
-        MAIN_MENU_TEXT, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD
+    name = update.effective_user.first_name or "there"
+    await update.effective_message.reply_text(
+        MAIN_MENU_CARD_TEXT.format(name=name),
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -47,51 +50,114 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     open_count = sum(1 for s in sessions if s["status"] == "open")
     total_items = sum(len(db.get_items(s["id"])) for s in sessions)
     user = update.effective_user
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"\U0001F464 *Profile*\n\n"
         f"Name: {user.full_name}\n"
         f"User ID: `{owner_id}`\n"
         f"Sessions: {len(sessions)} ({open_count} open)\n"
         f"Total items stored: {total_items}",
         parse_mode="Markdown",
+        reply_markup=back_to_menu_keyboard(),
     )
 
 
-@restricted
-async def create(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    owner_id = update.effective_user.id
-    label = " ".join(context.args) if context.args else None
+# ---------- /create as a name -> description -> confirm conversation ----------
 
+@restricted
+async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    owner_id = update.effective_user.id
     existing = db.get_active_session(owner_id)
     if existing:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"You already have an open session (`{existing['code']}`). "
             f"Send files now, or /stop to finish it first.",
             parse_mode="Markdown",
         )
-        return
+        return ConversationHandler.END
 
-    session = db.create_session(owner_id, label)
-    await update.message.reply_text(
-        f"\U0001F4E5 New session started \u2014 code `{session['code']}`.\n"
-        f"Send me any photos, videos, or files now. /stop when you're done.",
+    # Old-style fast path: "/create My Label" skips the conversation entirely.
+    if context.args:
+        label = " ".join(context.args)
+        session_row = db.create_session(owner_id, label)
+        from items import send_management_card
+        await send_management_card(update, context, session_row["code"], saved=True)
+        return ConversationHandler.END
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("\u23ED\ufe0f Skip", callback_data="create:skipname"),
+        InlineKeyboardButton("\u274C Cancel", callback_data="create:cancel"),
+    ]])
+    await update.effective_message.reply_text(
+        "\U0001F4E5 *New storage session*\n\nSend a *name* for it (e.g. _Vacation Photos_), or Skip:",
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
+    return NAME
+
+
+async def _ask_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("\u23ED\ufe0f Skip", callback_data="create:skipdesc"),
+        InlineKeyboardButton("\u274C Cancel", callback_data="create:cancel"),
+    ]])
+    await update.effective_message.reply_text(
+        "\U0001F4DD Add a short *description* for this storage (shown when someone opens the code), or Skip:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def create_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["pending_label"] = update.message.text.strip()
+    await _ask_description(update, context)
+    return DESC
+
+
+async def create_skip_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    context.user_data["pending_label"] = None
+    await _ask_description(update, context)
+    return DESC
+
+
+async def _finalize_create(update: Update, context: ContextTypes.DEFAULT_TYPE, description: str | None):
+    owner_id = update.effective_user.id
+    label = context.user_data.pop("pending_label", None)
+    session_row = db.create_session(owner_id, label)
+    if description:
+        db.set_description(owner_id, session_row["id"], description)
+    from items import send_management_card
+    await send_management_card(update, context, session_row["code"], saved=True)
+
+
+async def create_receive_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _finalize_create(update, context, update.message.text.strip())
+    return ConversationHandler.END
+
+
+async def create_skip_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await _finalize_create(update, context, None)
+    return ConversationHandler.END
+
+
+async def create_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+    context.user_data.pop("pending_label", None)
+    await update.effective_message.reply_text("Cancelled.")
+    return ConversationHandler.END
 
 
 @restricted
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_id = update.effective_user.id
-    session = db.close_active_session(owner_id)
-    if not session:
-        await update.message.reply_text("No open session to stop. /create to start one.")
+    session_row = db.close_active_session(owner_id)
+    if not session_row:
+        await update.effective_message.reply_text("No open session to stop. /create to start one.")
         return
-    items = db.get_items(session["id"])
-    await update.message.reply_text(
-        f"\u2705 Session closed \u2014 {len(items)} item(s) saved.\n"
-        f"Share code: `{session['code']}`",
-        parse_mode="Markdown",
-    )
+    from items import send_management_card
+    await send_management_card(update, context, session_row["code"], saved=True)
 
 
 @restricted
@@ -138,8 +204,8 @@ async def share_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = await _resolve_target_session(update, context)
     if not session:
         return
-    from items import send_share_card
-    await send_share_card(update, context, session["code"])
+    from items import send_management_card
+    await send_management_card(update, context, session["code"], saved=False)
 
 
 @restricted
