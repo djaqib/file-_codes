@@ -1,7 +1,7 @@
 import functools
 from datetime import datetime, timedelta, timezone
 
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 
 from config import ALLOWED_USER_IDS
@@ -12,6 +12,12 @@ DURATION_PRESETS = {
     "30d": timedelta(days=30),
     "90d": timedelta(days=90),
 }
+
+
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    """A single '◀ Menu' button, used on any navigation screen to return
+    to the main menu."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("\u25C0 Menu", callback_data="menu:root")]])
 
 
 def restricted(func):
