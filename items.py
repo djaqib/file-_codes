@@ -1,9 +1,11 @@
+from urllib.parse import quote
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 
 import db
 from config import VAULT_CHANNEL_ID
-from utils import restricted, file_type_and_id, is_expired
+from utils import restricted, file_type_and_id, is_expired, back_to_menu_keyboard
 
 SEND_METHOD = {
     "photo": "send_photo",
@@ -68,11 +70,11 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def auto_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a plain text message starts with FILE_CODE_PREFIX, so you
-    can just paste a code (optionally with a password after it) instead of
-    typing /open every time."""
-    context.args = update.message.text.strip().split()
-    await deliver_session(update, context)
+    """Fires when a plain text message starts with FILE_CODE_PREFIX (or is a
+    bare code the owner pastes). Shows the same confirmation card as /share
+    -- delivery only happens once Open is tapped."""
+    code = update.message.text.strip().split()[0]
+    await send_share_card(update, context, code)
 
 
 async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,6 +175,141 @@ async def cancel_share_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Cancelled.")
+
+
+def build_management_card(session: dict, bot_username: str, saved: bool = False):
+    """Owner-facing card: Items/Code/Link + Open/Info/Share link/Edit/Delete.
+    Used by /create, /stop, /share, and My Cloud."""
+    items = db.get_items(session["id"])
+    code = session["code"]
+    label = session["label"] or "Untitled"
+    header = f"\u2705 *{label} saved*" if saved else f"\U0001F4E6 *{label}*"
+
+    text = (
+        f"{header}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\u25B8 Items \u2014 {len(items)}\n"
+        f"\u25B8 Code \u2014 {code}\n"
+        f"\u25B8 \U0001F517 t.me/{bot_username}?start={code}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"Share the link, or manage it below \u2193"
+    )
+    share_url = f"https://t.me/share/url?url={quote(f'https://t.me/{bot_username}?start={code}')}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001F4C1 Open", callback_data=f"open_share:{code}"),
+         InlineKeyboardButton("\u2139\ufe0f Info", callback_data=f"card_info:{code}")],
+        [InlineKeyboardButton("\u2197\ufe0f Share link", url=share_url)],
+        [InlineKeyboardButton("\u270F\ufe0f Edit", callback_data=f"card_edit:{code}"),
+         InlineKeyboardButton("\U0001F5D1\ufe0f Delete", callback_data=f"card_delete:{code}")],
+    ])
+    return text, keyboard
+
+
+async def send_management_card(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str, saved: bool = False):
+    owner_id = update.effective_user.id
+    session = db.get_session_by_code(code)
+    if not session or session["owner_id"] != owner_id:
+        await _reply(update, "Session not found.")
+        return
+    bot = await context.bot.get_me()
+    text, keyboard = build_management_card(session, bot.username, saved=saved)
+    await update.effective_message.reply_text(
+        text, parse_mode="Markdown", reply_markup=keyboard, disable_web_page_preview=False
+    )
+
+
+async def card_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when a session row is tapped in My Cloud -- shows its management card."""
+    query = update.callback_query
+    await query.answer()
+    code = query.data.split(":", 1)[1]
+    await send_management_card(update, context, code, saved=False)
+
+
+async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when Info is tapped on a management card -- shows full stats."""
+    query = update.callback_query
+    await query.answer()
+    code = query.data.split(":", 1)[1]
+    owner_id = update.effective_user.id
+    session = db.get_session_by_code(code)
+    if not session or session["owner_id"] != owner_id:
+        await query.message.reply_text("Session not found.")
+        return
+    items = db.get_items(session["id"])
+    tags = db.get_tags(session["id"])
+    limit = session["download_limit"]
+    limit_str = f"{session['downloads_used']}/{limit}" if limit else "unlimited"
+    lock_str = "yes" if session["password_hash"] else "no"
+    await query.message.reply_text(
+        f"\u2139\ufe0f *Session Info*\n\n"
+        f"Code: `{session['code']}`\n"
+        f"Label: {session['label'] or '(none)'}\n"
+        f"Description: {session['description'] or '(none)'}\n"
+        f"Items: {len(items)}\n"
+        f"Tags: {', '.join(tags) or '(none)'}\n"
+        f"Password protected: {lock_str}\n"
+        f"Downloads used: {limit_str}\n"
+        f"Expires: {session['expires_at'] or 'never'}\n"
+        f"Status: {session['status']}",
+        parse_mode="Markdown",
+    )
+
+
+async def card_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when Edit is tapped -- reopens the session so more files can be added."""
+    query = update.callback_query
+    await query.answer()
+    code = query.data.split(":", 1)[1]
+    owner_id = update.effective_user.id
+    session = db.get_session_by_code(code)
+    if not session or session["owner_id"] != owner_id:
+        await query.message.reply_text("Session not found.")
+        return
+    db.reopen_session(owner_id, session["id"])
+    await query.message.reply_text(f"Reopened `{code}`. Send more files, then /stop.", parse_mode="Markdown")
+
+
+async def card_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when Delete is tapped -- removes the session and its items."""
+    query = update.callback_query
+    await query.answer()
+    code = query.data.split(":", 1)[1]
+    owner_id = update.effective_user.id
+    session = db.get_session_by_code(code)
+    if not session or session["owner_id"] != owner_id:
+        await query.message.reply_text("Session not found.")
+        return
+    db.delete_session(owner_id, session["id"])
+    await query.edit_message_text(f"\U0001F5D1\ufe0f Deleted `{code}`.", parse_mode="Markdown")
+
+
+async def cloud_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The 'My Cloud' screen -- tap a session to manage it, or go back to the menu."""
+    owner_id = update.effective_user.id
+    sessions = db.list_sessions(owner_id, limit=50)
+
+    rows = []
+    for s in sessions:
+        marker = "\U0001F7E2" if s["status"] == "open" else "\u26AA"
+        label = s["label"] or "Untitled"
+        rows.append([InlineKeyboardButton(f"{marker} {label} ({s['code']})", callback_data=f"card_view:{s['code']}")])
+    rows.append([InlineKeyboardButton("\u25C0 Menu", callback_data="menu:root")])
+    keyboard = InlineKeyboardMarkup(rows)
+
+    if not sessions:
+        text = (
+            "\U0001F4C1 *My Cloud*\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+            "Nothing here yet \u2014 tap \U0001F4E5 New Upload!"
+        )
+    else:
+        text = (
+            "\U0001F4C1 *My Cloud*\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+            "Tap a session to manage it:"
+        )
+    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 @restricted
