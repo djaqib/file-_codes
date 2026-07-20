@@ -2,18 +2,19 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 import db
-from utils import restricted
+from utils import restricted, back_to_menu_keyboard
 
 
 @restricted
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = db.get_settings(update.effective_user.id)
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Captions: {'on' if s['captions_enabled'] else 'off'}\n"
         f"Album grouping: {'on' if s['album_grouping'] else 'off'}\n"
         f"Dedup (photos): {'on' if s['dedup_photos_enabled'] else 'off'}\n"
         f"Dedup (documents): {'on' if s['dedup_documents_enabled'] else 'off'}\n\n"
-        f"/togglecaptions, /togglealbum, /toggledupphotos, or /toggledupdocs to change."
+        f"/togglecaptions, /togglealbum, /toggledupphotos, or /toggledupdocs to change.",
+        reply_markup=back_to_menu_keyboard(),
     )
 
 
