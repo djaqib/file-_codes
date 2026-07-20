@@ -10,6 +10,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -86,14 +87,35 @@ async def post_init(app: Application):
 
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.effective_message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
 @restricted
 async def open_code_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"Send /open <code>, or just paste a code starting with {FILE_CODE_PREFIX}"
     )
+
+
+@restricted
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the main menu's inline buttons (except 'New Upload', which is
+    a ConversationHandler entry point registered separately)."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "menu:root":
+        await session.start(update, context)
+    elif data == "menu:cloud":
+        await items.cloud_view(update, context)
+    elif data == "menu:profile":
+        await session.profile(update, context)
+    elif data == "menu:opencode":
+        await open_code_prompt(update, context)
+    elif data == "menu:settings":
+        await settings.settings(update, context)
+    elif data == "menu:help":
+        await help_command(update, context)
 
 
 # ---------- keep-alive web server ----------
@@ -126,7 +148,6 @@ def main():
 
     # session lifecycle
     app.add_handler(CommandHandler("start", session.start))
-    app.add_handler(CommandHandler("create", session.create))
     app.add_handler(CommandHandler("stop", session.stop))
     app.add_handler(CommandHandler("open", session.open_code))
     app.add_handler(CommandHandler("list", session.list_sessions))
@@ -139,6 +160,29 @@ def main():
     app.add_handler(CommandHandler("delete", session.delete))
     app.add_handler(CommandHandler("tag", session.tag))
     app.add_handler(CommandHandler("untag", session.untag))
+
+    # /create as a name -> description -> confirm conversation. Also
+    # reachable by tapping "New Upload" on the main menu.
+    create_conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler("create", session.create_start),
+            CallbackQueryHandler(session.create_start, pattern=r"^menu:upload$"),
+        ],
+        states={
+            session.NAME: [
+                CallbackQueryHandler(session.create_skip_name, pattern=r"^create:skipname$"),
+                CallbackQueryHandler(session.create_cancel, pattern=r"^create:cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, session.create_receive_name),
+            ],
+            session.DESC: [
+                CallbackQueryHandler(session.create_skip_desc, pattern=r"^create:skipdesc$"),
+                CallbackQueryHandler(session.create_cancel, pattern=r"^create:cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, session.create_receive_desc),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", session.create_cancel)],
+    )
+    app.add_handler(create_conversation)
 
     # access control
     app.add_handler(CommandHandler("lock", access.lock))
@@ -156,9 +200,14 @@ def main():
         filters.TEXT & ~filters.COMMAND & filters.Regex(re.compile(rf"^{re.escape(FILE_CODE_PREFIX)}", re.IGNORECASE)),
         items.auto_open,
     ))
-    # Inline Open / Cancel buttons on a share card.
+    # Inline Open / Cancel buttons on the recipient-facing share card.
     app.add_handler(CallbackQueryHandler(items.open_share_callback, pattern=r"^open_share:"))
     app.add_handler(CallbackQueryHandler(items.cancel_share_callback, pattern=r"^cancel_share$"))
+    # Buttons on the owner-facing management card (My Cloud, /share, /create, /stop).
+    app.add_handler(CallbackQueryHandler(items.card_view_callback, pattern=r"^card_view:"))
+    app.add_handler(CallbackQueryHandler(items.card_info_callback, pattern=r"^card_info:"))
+    app.add_handler(CallbackQueryHandler(items.card_edit_callback, pattern=r"^card_edit:"))
+    app.add_handler(CallbackQueryHandler(items.card_delete_callback, pattern=r"^card_delete:"))
 
     # settings
     app.add_handler(CommandHandler("settings", settings.settings))
@@ -169,14 +218,8 @@ def main():
 
     app.add_handler(CommandHandler("help", help_command))
 
-    # Persistent reply-keyboard buttons (shown after /start) -- each just
-    # re-triggers the equivalent command's handler.
-    app.add_handler(MessageHandler(filters.Regex(r"^\U0001F4E5 New Upload$"), session.create))
-    app.add_handler(MessageHandler(filters.Regex(r"^\U0001F4C1 My Cloud$"), session.list_sessions))
-    app.add_handler(MessageHandler(filters.Regex(r"^\U0001F464 Profile$"), session.profile))
-    app.add_handler(MessageHandler(filters.Regex(r"^\U0001F511 Open Code$"), open_code_prompt))
-    app.add_handler(MessageHandler(filters.Regex(r"^\u2699\ufe0f Settings$"), settings.settings))
-    app.add_handler(MessageHandler(filters.Regex(r"^\u2753 Help$"), help_command))
+    # Main menu's inline buttons (New Upload is handled by create_conversation above).
+    app.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu:(cloud|profile|opencode|settings|help|root)$"))
 
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
