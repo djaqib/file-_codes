@@ -91,6 +91,7 @@ def init_db():
         cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS file_unique_id TEXT;")
         cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS dedup_photos_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
         cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS dedup_documents_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS description TEXT;")
 
 
 # ---------- codes / passwords ----------
@@ -199,6 +200,15 @@ def rename_session(owner_id: int, session_id: int, label: str) -> bool:
         cur.execute(
             "UPDATE sessions SET label = %s WHERE id = %s AND owner_id = %s",
             (label, session_id, owner_id),
+        )
+        return cur.rowcount > 0
+
+
+def set_description(owner_id: int, session_id: int, description: str | None) -> bool:
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET description = %s WHERE id = %s AND owner_id = %s",
+            (description, session_id, owner_id),
         )
         return cur.rowcount > 0
 
