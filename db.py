@@ -74,8 +74,10 @@ def init_db():
             user_id                    BIGINT PRIMARY KEY,
             captions_enabled           BOOLEAN NOT NULL DEFAULT TRUE,
             album_grouping             BOOLEAN NOT NULL DEFAULT TRUE,
-            dedup_photos_enabled       BOOLEAN NOT NULL DEFAULT TRUE,
-            dedup_documents_enabled    BOOLEAN NOT NULL DEFAULT TRUE
+            dedup_enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+            accept_photos_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+            accept_text_enabled        BOOLEAN NOT NULL DEFAULT TRUE,
+            accept_documents_enabled   BOOLEAN NOT NULL DEFAULT TRUE
         );
         """)
         cur.execute("""
@@ -89,9 +91,14 @@ def init_db():
         # were first created in production, so CREATE TABLE IF NOT EXISTS
         # alone won't add them to an already-existing table.
         cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS file_unique_id TEXT;")
-        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS dedup_photos_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
-        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS dedup_documents_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
         cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS description TEXT;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS dedup_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_photos_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_text_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_documents_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        # Superseded by the single dedup_enabled toggle above.
+        cur.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS dedup_photos_enabled;")
+        cur.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS dedup_documents_enabled;")
 
 
 # ---------- codes / passwords ----------
@@ -342,17 +349,33 @@ def toggle_album(user_id: int) -> bool:
     return new_val
 
 
-def toggle_dedup_photos(user_id: int) -> bool:
+def toggle_dedup(user_id: int) -> bool:
     settings = get_settings(user_id)
-    new_val = not settings["dedup_photos_enabled"]
+    new_val = not settings["dedup_enabled"]
     with get_cursor(commit=True) as cur:
-        cur.execute("UPDATE user_settings SET dedup_photos_enabled = %s WHERE user_id = %s", (new_val, user_id))
+        cur.execute("UPDATE user_settings SET dedup_enabled = %s WHERE user_id = %s", (new_val, user_id))
     return new_val
 
 
-def toggle_dedup_documents(user_id: int) -> bool:
+def toggle_accept_photos(user_id: int) -> bool:
     settings = get_settings(user_id)
-    new_val = not settings["dedup_documents_enabled"]
+    new_val = not settings["accept_photos_enabled"]
     with get_cursor(commit=True) as cur:
-        cur.execute("UPDATE user_settings SET dedup_documents_enabled = %s WHERE user_id = %s", (new_val, user_id))
+        cur.execute("UPDATE user_settings SET accept_photos_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
+
+
+def toggle_accept_text(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["accept_text_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET accept_text_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
+
+
+def toggle_accept_documents(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["accept_documents_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET accept_documents_enabled = %s WHERE user_id = %s", (new_val, user_id))
     return new_val
