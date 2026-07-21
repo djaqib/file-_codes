@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
+from telegram.helpers import escape_markdown
 
 from config import ALLOWED_USER_IDS
 
@@ -12,6 +13,15 @@ DURATION_PRESETS = {
     "30d": timedelta(days=30),
     "90d": timedelta(days=90),
 }
+
+
+def md(text) -> str:
+    """Escape legacy-Markdown special characters (_ * ` [) in any dynamic
+    text -- codes, labels, names, descriptions -- before it goes into a
+    parse_mode='Markdown' message. Codes like FILEQQ_XXXXXXXX contain a
+    literal underscore, which Telegram's parser otherwise reads as an
+    unmatched italics marker and rejects the whole message for."""
+    return escape_markdown(str(text), version=1)
 
 
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
