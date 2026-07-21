@@ -1,341 +1,381 @@
-from urllib.parse import quote
+"""
+Postgres access layer.
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes
+Uses a small psycopg2 connection pool. All functions are synchronous —
+handlers call them via `context.application.run_in_executor` or plain
+sync calls wrapped with `asyncio.to_thread` (see handlers/*.py).
+"""
+import secrets
+import hashlib
+from contextlib import contextmanager
 
-import db
-from config import VAULT_CHANNEL_ID
-from utils import restricted, file_type_and_id, is_expired, back_to_menu_keyboard, md
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import SimpleConnectionPool
 
-SEND_METHOD = {
-    "photo": "send_photo",
-    "video": "send_video",
-    "document": "send_document",
-    "animation": "send_animation",
-    "audio": "send_audio",
-    "voice": "send_voice",
-}
+from config import DATABASE_URL, SHARE_CODE_LENGTH, SHARE_CODE_ALPHABET, FILE_CODE_PREFIX
 
-
-async def _reply(update: Update, text: str, **kwargs):
-    """Works whether this update came from a regular message or a button tap."""
-    if update.callback_query:
-        await update.callback_query.message.reply_text(text, **kwargs)
-    else:
-        await update.message.reply_text(text, **kwargs)
+_pool = SimpleConnectionPool(1, 10, dsn=DATABASE_URL)
 
 
-@restricted
-async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires on any incoming photo/video/document/etc. Auto-creates a
-    session if you forgot to /create one first."""
-    owner_id = update.effective_user.id
-    message = update.message
+@contextmanager
+def get_cursor(commit=False):
+    conn = _pool.getconn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        yield cur
+        if commit:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        _pool.putconn(conn)
 
-    session = db.get_active_session(owner_id)
+
+def init_db():
+    with get_cursor(commit=True) as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id              SERIAL PRIMARY KEY,
+            owner_id        BIGINT NOT NULL,
+            code            TEXT UNIQUE NOT NULL,
+            label           TEXT,
+            status          TEXT NOT NULL DEFAULT 'open',  -- open | closed
+            password_hash   TEXT,
+            download_limit  INTEGER,                       -- NULL = unlimited
+            downloads_used  INTEGER NOT NULL DEFAULT 0,
+            expires_at      TIMESTAMPTZ,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id               SERIAL PRIMARY KEY,
+            session_id       INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            vault_chat_id    BIGINT NOT NULL,
+            vault_message_id BIGINT NOT NULL,
+            file_type        TEXT NOT NULL,   -- photo | video | document | animation | audio
+            file_unique_id   TEXT,            -- Telegram's stable per-file identifier, used for dedup
+            caption          TEXT,
+            added_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tags (
+            id          SERIAL PRIMARY KEY,
+            session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            tag         TEXT NOT NULL
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id                    BIGINT PRIMARY KEY,
+            captions_enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+            album_grouping             BOOLEAN NOT NULL DEFAULT TRUE,
+            dedup_enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+            accept_photos_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+            accept_text_enabled        BOOLEAN NOT NULL DEFAULT TRUE,
+            accept_documents_enabled   BOOLEAN NOT NULL DEFAULT TRUE
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS active_session (
+            user_id     BIGINT PRIMARY KEY,
+            session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        """)
+
+        # Migration-safe: these columns were added after the tables above
+        # were first created in production, so CREATE TABLE IF NOT EXISTS
+        # alone won't add them to an already-existing table.
+        cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS file_unique_id TEXT;")
+        cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS description TEXT;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS dedup_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_photos_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_text_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_documents_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
+        # Superseded by the single dedup_enabled toggle above.
+        cur.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS dedup_photos_enabled;")
+        cur.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS dedup_documents_enabled;")
+
+
+# ---------- codes / passwords ----------
+
+def generate_unique_code():
+    with get_cursor() as cur:
+        while True:
+            code = FILE_CODE_PREFIX + "".join(secrets.choice(SHARE_CODE_ALPHABET) for _ in range(SHARE_CODE_LENGTH))
+            cur.execute("SELECT 1 FROM sessions WHERE code = %s", (code,))
+            if cur.fetchone() is None:
+                return code
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+# ---------- sessions ----------
+
+def create_session(owner_id: int, label: str | None = None) -> dict:
+    code = generate_unique_code()
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "INSERT INTO sessions (owner_id, code, label) VALUES (%s, %s, %s) RETURNING *",
+            (owner_id, code, label),
+        )
+        session = cur.fetchone()
+        cur.execute(
+            """INSERT INTO active_session (user_id, session_id) VALUES (%s, %s)
+               ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id""",
+            (owner_id, session["id"]),
+        )
+        return session
+
+
+def get_active_session(owner_id: int) -> dict | None:
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT s.* FROM sessions s
+            JOIN active_session a ON a.session_id = s.id
+            WHERE a.user_id = %s AND s.status = 'open'
+        """, (owner_id,))
+        return cur.fetchone()
+
+
+def close_active_session(owner_id: int) -> dict | None:
+    session = get_active_session(owner_id)
     if not session:
-        session = db.create_session(owner_id)
-        await message.reply_text(
-            f"\U0001F4E5 No open session \u2014 started one automatically "
-            f"(code `{session['code']}`). Send /stop when done.",
-            parse_mode="Markdown",
+        return None
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE sessions SET status = 'closed' WHERE id = %s", (session["id"],))
+        cur.execute("DELETE FROM active_session WHERE user_id = %s", (owner_id,))
+    return session
+
+
+def reopen_session(owner_id: int, session_id: int) -> bool:
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET status = 'open' WHERE id = %s AND owner_id = %s",
+            (session_id, owner_id),
+        )
+        if cur.rowcount == 0:
+            return False
+        cur.execute(
+            """INSERT INTO active_session (user_id, session_id) VALUES (%s, %s)
+               ON CONFLICT (user_id) DO UPDATE SET session_id = EXCLUDED.session_id""",
+            (owner_id, session_id),
+        )
+        return True
+
+
+def get_session_by_code(code: str) -> dict | None:
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM sessions WHERE code = %s", (code.strip().upper(),))
+        return cur.fetchone()
+
+
+def list_sessions(owner_id: int, limit: int = 30) -> list:
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM sessions WHERE owner_id = %s ORDER BY created_at DESC LIMIT %s",
+            (owner_id, limit),
+        )
+        return cur.fetchall()
+
+
+def search_sessions(owner_id: int, term: str) -> list:
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT s.* FROM sessions s
+            LEFT JOIN tags t ON t.session_id = s.id
+            WHERE s.owner_id = %s AND (s.label ILIKE %s OR t.tag ILIKE %s)
+            ORDER BY s.created_at DESC
+        """, (owner_id, f"%{term}%", f"%{term}%"))
+        return cur.fetchall()
+
+
+def delete_session(owner_id: int, session_id: int) -> bool:
+    with get_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM sessions WHERE id = %s AND owner_id = %s", (session_id, owner_id))
+        return cur.rowcount > 0
+
+
+def rename_session(owner_id: int, session_id: int, label: str) -> bool:
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET label = %s WHERE id = %s AND owner_id = %s",
+            (label, session_id, owner_id),
+        )
+        return cur.rowcount > 0
+
+
+def set_description(owner_id: int, session_id: int, description: str | None) -> bool:
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET description = %s WHERE id = %s AND owner_id = %s",
+            (description, session_id, owner_id),
+        )
+        return cur.rowcount > 0
+
+
+def set_password(owner_id: int, session_id: int, password: str | None) -> bool:
+    pw_hash = hash_password(password) if password else None
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET password_hash = %s WHERE id = %s AND owner_id = %s",
+            (pw_hash, session_id, owner_id),
+        )
+        return cur.rowcount > 0
+
+
+def set_download_limit(owner_id: int, session_id: int, limit: int | None) -> bool:
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET download_limit = %s WHERE id = %s AND owner_id = %s",
+            (limit, session_id, owner_id),
+        )
+        return cur.rowcount > 0
+
+
+def set_expiry(owner_id: int, session_id: int, expires_at) -> bool:
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET expires_at = %s WHERE id = %s AND owner_id = %s",
+            (expires_at, session_id, owner_id),
+        )
+        return cur.rowcount > 0
+
+
+def increment_downloads(session_id: int):
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE sessions SET downloads_used = downloads_used + 1 WHERE id = %s",
+            (session_id,),
         )
 
-    file_type, file_id, file_unique_id = file_type_and_id(message)
-    if not file_id:
-        return  # not a file we handle (e.g. plain text) -- ignore silently
 
-    settings = db.get_settings(owner_id)
+# ---------- items ----------
 
-    # Dedup only ever looks within THIS active session, and only for the
-    # file types you've enabled it for.
-    dedup_applies = (
-        (file_type == "photo" and settings["dedup_photos_enabled"])
-        or (file_type == "document" and settings["dedup_documents_enabled"])
-    )
-    if dedup_applies and db.is_duplicate_in_session(session["id"], file_unique_id):
-        await message.reply_text("\u26A0\ufe0f Duplicate \u2014 already in this session, skipped.")
-        return
-
-    caption = message.caption if settings["captions_enabled"] else None
-
-    # Forward the actual bytes into the private vault channel so the file
-    # survives even if this bot / this chat is later deleted or banned.
-    send = getattr(context.bot, SEND_METHOD[file_type])
-    vault_message = await send(chat_id=VAULT_CHANNEL_ID, **{file_type: file_id}, caption=caption)
-
-    db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, file_type, caption, file_unique_id)
-    await message.reply_text("\u2705 Saved to current session.")
-
-
-@restricted
-async def auto_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a plain text message starts with FILE_CODE_PREFIX (or is a
-    bare code the owner pastes). Shows the same confirmation card as /share
-    -- delivery only happens once Open is tapped."""
-    code = update.message.text.strip().split()[0]
-    await send_share_card(update, context, code)
-
-
-async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/open <code> [password] -- called from handlers/session.py:open_code,
-    directly from auto_open, or from the Open button on a share card."""
-    if not context.args:
-        await _reply(update, "Usage: /open <code> [password]")
-        return
-
-    code = context.args[0]
-    password = context.args[1] if len(context.args) > 1 else None
-
-    session = db.get_session_by_code(code)
-    if not session:
-        await _reply(update, "No session found with that code.")
-        return
-
-    if is_expired(session):
-        await _reply(update, "This share has expired.")
-        return
-
-    if session["password_hash"]:
-        if not password or db.hash_password(password) != session["password_hash"]:
-            await _reply(update, "This share is password protected. Usage: /open <code> <password>")
-            return
-
-    limit = session["download_limit"]
-    if limit and session["downloads_used"] >= limit:
-        await _reply(update, "This share has hit its download limit.")
-        return
-
-    items = db.get_items(session["id"])
-    if not items:
-        await _reply(update, "This session has no items.")
-        return
-
-    chat_id = update.effective_chat.id
-    for item in items:
-        await context.bot.forward_message(
-            chat_id=chat_id,
-            from_chat_id=item["vault_chat_id"],
-            message_id=item["vault_message_id"],
+def add_item(session_id: int, vault_chat_id: int, vault_message_id: int, file_type: str, caption: str | None, file_unique_id: str | None = None):
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            """INSERT INTO items (session_id, vault_chat_id, vault_message_id, file_type, caption, file_unique_id)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
+            (session_id, vault_chat_id, vault_message_id, file_type, caption, file_unique_id),
         )
-
-    db.increment_downloads(session["id"])
-    await _reply(update, f"\u2705 Delivered {len(items)} item(s) from `{code}`.", parse_mode="Markdown")
+        return cur.fetchone()
 
 
-def build_share_card(session: dict, bot_username: str):
-    """Card layout matching the reference bot: stats + a deep link + Open/Cancel buttons."""
-    items = db.get_items(session["id"])
-    code = session["code"]
-    label = session["label"] or "Untitled"
-    expires = session["expires_at"] or "never"
-    limit = session["download_limit"]
-    downloads_str = f"{session['downloads_used']}/{limit}" if limit else str(session["downloads_used"])
-
-    text = (
-        f"\U0001F4E6 *{md(label)}*\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u25B8 Items \u2014 {len(items)}\n"
-        f"\u25B8 Expires \u2014 {expires}\n"
-        f"\u25B8 Downloads \u2014 {downloads_str}\n"
-        f"\u25B8 Code \u2014 {md(code)}\n"
-        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Open this share? \u2193"
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("\U0001F4E7 Open", callback_data=f"open_share:{code}"),
-        InlineKeyboardButton("\u274C Cancel", callback_data="cancel_share"),
-    ]])
-    return text, keyboard
+def get_items(session_id: int) -> list:
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM items WHERE session_id = %s ORDER BY added_at", (session_id,))
+        return cur.fetchall()
 
 
-async def send_share_card(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
-    owner_id = update.effective_user.id
-    session = db.get_session_by_code(code)
-    if not session or session["owner_id"] != owner_id:
-        await _reply(update, "Session not found.")
-        return
-    bot = await context.bot.get_me()
-    text, keyboard = build_share_card(session, bot.username)
-    await _reply(update, text, parse_mode="Markdown", reply_markup=keyboard)
+def delete_item(item_id: int) -> dict | None:
+    with get_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM items WHERE id = %s RETURNING *", (item_id,))
+        return cur.fetchone()
 
 
-async def open_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when the Open button on a share card is tapped."""
-    query = update.callback_query
-    await query.answer()
-    code = query.data.split(":", 1)[1]
-    context.args = [code]
-    await deliver_session(update, context)
+def get_item_by_vault_message(vault_message_id: int) -> dict | None:
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM items WHERE vault_message_id = %s", (vault_message_id,))
+        return cur.fetchone()
 
 
-async def cancel_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when the Cancel button on a share card is tapped."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Cancelled.")
-
-
-def build_management_card(session: dict, bot_username: str, saved: bool = False):
-    """Owner-facing card: Items/Code/Link + Open/Info/Share link/Edit/Delete.
-    Used by /create, /stop, /share, and My Cloud."""
-    items = db.get_items(session["id"])
-    code = session["code"]
-    label = session["label"] or "Untitled"
-    header = f"\u2705 *{md(label)} saved*" if saved else f"\U0001F4E6 *{md(label)}*"
-
-    text = (
-        f"{header}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u25B8 Items \u2014 {len(items)}\n"
-        f"\u25B8 Code \u2014 {md(code)}\n"
-        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Share the link, or manage it below \u2193"
-    )
-    share_url = f"https://t.me/share/url?url={quote(f'https://t.me/{bot_username}?start={code}')}"
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001F4C1 Open", callback_data=f"open_share:{code}"),
-         InlineKeyboardButton("\u2139\ufe0f Info", callback_data=f"card_info:{code}")],
-        [InlineKeyboardButton("\u2197\ufe0f Share link", url=share_url)],
-        [InlineKeyboardButton("\u270F\ufe0f Edit", callback_data=f"card_edit:{code}"),
-         InlineKeyboardButton("\U0001F5D1\ufe0f Delete", callback_data=f"card_delete:{code}")],
-    ])
-    return text, keyboard
-
-
-async def send_management_card(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str, saved: bool = False):
-    owner_id = update.effective_user.id
-    session = db.get_session_by_code(code)
-    if not session or session["owner_id"] != owner_id:
-        await _reply(update, "Session not found.")
-        return
-    bot = await context.bot.get_me()
-    text, keyboard = build_management_card(session, bot.username, saved=saved)
-    await update.effective_message.reply_text(
-        text, parse_mode="Markdown", reply_markup=keyboard, disable_web_page_preview=False
-    )
-
-
-async def card_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a session row is tapped in My Cloud -- shows its management card."""
-    query = update.callback_query
-    await query.answer()
-    code = query.data.split(":", 1)[1]
-    await send_management_card(update, context, code, saved=False)
-
-
-async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Info is tapped on a management card -- shows full stats."""
-    query = update.callback_query
-    await query.answer()
-    code = query.data.split(":", 1)[1]
-    owner_id = update.effective_user.id
-    session = db.get_session_by_code(code)
-    if not session or session["owner_id"] != owner_id:
-        await query.message.reply_text("Session not found.")
-        return
-    items = db.get_items(session["id"])
-    tags = db.get_tags(session["id"])
-    limit = session["download_limit"]
-    limit_str = f"{session['downloads_used']}/{limit}" if limit else "unlimited"
-    lock_str = "yes" if session["password_hash"] else "no"
-    await query.message.reply_text(
-        f"\u2139\ufe0f *Session Info*\n\n"
-        f"Code: `{code}`\n"
-        f"Label: {md(session['label']) if session['label'] else '(none)'}\n"
-        f"Description: {md(session['description']) if session['description'] else '(none)'}\n"
-        f"Items: {len(items)}\n"
-        f"Tags: {md(', '.join(tags)) if tags else '(none)'}\n"
-        f"Password protected: {lock_str}\n"
-        f"Downloads used: {limit_str}\n"
-        f"Expires: {session['expires_at'] or 'never'}\n"
-        f"Status: {session['status']}",
-        parse_mode="Markdown",
-    )
-
-
-async def card_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Edit is tapped -- reopens the session so more files can be added."""
-    query = update.callback_query
-    await query.answer()
-    code = query.data.split(":", 1)[1]
-    owner_id = update.effective_user.id
-    session = db.get_session_by_code(code)
-    if not session or session["owner_id"] != owner_id:
-        await query.message.reply_text("Session not found.")
-        return
-    db.reopen_session(owner_id, session["id"])
-    await query.message.reply_text(f"Reopened `{code}`. Send more files, then /stop.", parse_mode="Markdown")
-
-
-async def card_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Delete is tapped -- removes the session and its items."""
-    query = update.callback_query
-    await query.answer()
-    code = query.data.split(":", 1)[1]
-    owner_id = update.effective_user.id
-    session = db.get_session_by_code(code)
-    if not session or session["owner_id"] != owner_id:
-        await query.message.reply_text("Session not found.")
-        return
-    db.delete_session(owner_id, session["id"])
-    await query.edit_message_text(f"\U0001F5D1\ufe0f Deleted `{code}`.", parse_mode="Markdown")
-
-
-async def cloud_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The 'My Cloud' screen -- tap a session to manage it, or go back to the menu."""
-    owner_id = update.effective_user.id
-    sessions = db.list_sessions(owner_id, limit=50)
-
-    rows = []
-    for s in sessions:
-        marker = "\U0001F7E2" if s["status"] == "open" else "\u26AA"
-        label = s["label"] or "Untitled"
-        rows.append([InlineKeyboardButton(f"{marker} {label} ({s['code']})", callback_data=f"card_view:{s['code']}")])
-    rows.append([InlineKeyboardButton("\u25C0 Menu", callback_data="menu:root")])
-    keyboard = InlineKeyboardMarkup(rows)
-
-    if not sessions:
-        text = (
-            "\U0001F4C1 *My Cloud*\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
-            "Nothing here yet \u2014 tap \U0001F4E5 New Upload!"
+def is_duplicate_in_session(session_id: int, file_unique_id: str) -> bool:
+    """Checks for this exact file within THIS session only -- dedup never
+    looks across sessions, past or present."""
+    if not file_unique_id:
+        return False
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM items WHERE session_id = %s AND file_unique_id = %s LIMIT 1",
+            (session_id, file_unique_id),
         )
-    else:
-        text = (
-            "\U0001F4C1 *My Cloud*\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
-            "Tap a session to manage it:"
+        return cur.fetchone() is not None
+
+
+# ---------- tags ----------
+
+def add_tags(session_id: int, tags: list[str]):
+    with get_cursor(commit=True) as cur:
+        for tag in tags:
+            cur.execute("INSERT INTO tags (session_id, tag) VALUES (%s, %s)", (session_id, tag.strip().lower()))
+
+
+def clear_tags(session_id: int):
+    with get_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM tags WHERE session_id = %s", (session_id,))
+
+
+def get_tags(session_id: int) -> list:
+    with get_cursor() as cur:
+        cur.execute("SELECT tag FROM tags WHERE session_id = %s", (session_id,))
+        return [r["tag"] for r in cur.fetchall()]
+
+
+# ---------- user settings ----------
+
+def get_settings(user_id: int) -> dict:
+    with get_cursor(commit=True) as cur:
+        cur.execute("SELECT * FROM user_settings WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        if row:
+            return row
+        cur.execute(
+            "INSERT INTO user_settings (user_id) VALUES (%s) RETURNING *",
+            (user_id,),
         )
-    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return cur.fetchone()
 
 
-@restricted
-async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/remove -- reply to a message the bot sent you (from an /open delivery)
-    to delete that item from its session. Matching is done by forwarded
-    vault message id, so this only works within the same chat where the
-    item was delivered."""
-    message = update.message
-    if not message.reply_to_message:
-        await message.reply_text("Reply to a delivered item with /remove to delete it.")
-        return
+def toggle_captions(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["captions_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET captions_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
 
-    forward_origin = message.reply_to_message.forward_origin
-    # NOTE: matching a forwarded message back to its vault copy requires the
-    # forward_origin's message id, which Telegram only exposes for channel
-    # forwards. This works for items delivered via /open (forwarded from the
-    # vault channel).
-    if not forward_origin or not hasattr(forward_origin, "message_id"):
-        await message.reply_text("Couldn't identify that item. /remove only works on delivered files.")
-        return
 
-    item = db.get_item_by_vault_message(forward_origin.message_id)
-    if not item:
-        await message.reply_text("Couldn't find that item in any session.")
-        return
+def toggle_album(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["album_grouping"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET album_grouping = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
 
-    db.delete_item(item["id"])
-    await message.reply_text("\U0001F5D1\ufe0f Removed.")
+
+def toggle_dedup(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["dedup_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET dedup_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
+
+
+def toggle_accept_photos(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["accept_photos_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET accept_photos_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
+
+
+def toggle_accept_text(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["accept_text_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET accept_text_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
+
+
+def toggle_accept_documents(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["accept_documents_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute("UPDATE user_settings SET accept_documents_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
