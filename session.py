@@ -2,7 +2,7 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 
 import db
-from utils import restricted, parse_duration, back_to_menu_keyboard
+from utils import restricted, parse_duration, back_to_menu_keyboard, md
 
 MAIN_MENU_CARD_TEXT = (
     "\U0001F47B *GHOST'S STORAGE*\n"
@@ -37,7 +37,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = update.effective_user.first_name or "there"
     await update.effective_message.reply_text(
-        MAIN_MENU_CARD_TEXT.format(name=name),
+        MAIN_MENU_CARD_TEXT.format(name=md(name)),
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -52,7 +52,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.effective_message.reply_text(
         f"\U0001F464 *Profile*\n\n"
-        f"Name: {user.full_name}\n"
+        f"Name: {md(user.full_name)}\n"
         f"User ID: `{owner_id}`\n"
         f"Sessions: {len(sessions)} ({open_count} open)\n"
         f"Total items stored: {total_items}",
@@ -179,7 +179,7 @@ async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     for s in sessions:
         marker = "\U0001F7E2" if s["status"] == "open" else "\u26AA"
-        label = f" \u2013 {s['label']}" if s["label"] else ""
+        label = f" \u2013 {md(s['label'])}" if s["label"] else ""
         lines.append(f"{marker} `{s['code']}`{label}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -195,7 +195,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not results:
         await update.message.reply_text(f"No sessions matching '{term}'.")
         return
-    lines = [f"`{s['code']}` \u2013 {s['label'] or '(untitled)'}" for s in results]
+    lines = [f"`{s['code']}` \u2013 {md(s['label']) if s['label'] else '(untitled)'}" for s in results]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -236,7 +236,7 @@ async def label(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Session not found.")
         return
     db.rename_session(owner_id, session["id"], new_label)
-    await update.message.reply_text(f"Renamed `{code}` to \u201c{new_label}\u201d.", parse_mode="Markdown")
+    await update.message.reply_text(f"Renamed `{code}` to \u201c{md(new_label)}\u201d.", parse_mode="Markdown")
 
 
 @restricted
