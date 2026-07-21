@@ -5,7 +5,7 @@ from telegram.ext import ContextTypes
 
 import db
 from config import VAULT_CHANNEL_ID
-from utils import restricted, file_type_and_id, is_expired, back_to_menu_keyboard
+from utils import restricted, file_type_and_id, is_expired, back_to_menu_keyboard, md
 
 SEND_METHOD = {
     "photo": "send_photo",
@@ -133,13 +133,13 @@ def build_share_card(session: dict, bot_username: str):
     downloads_str = f"{session['downloads_used']}/{limit}" if limit else str(session["downloads_used"])
 
     text = (
-        f"\U0001F4E6 *{label}*\n"
+        f"\U0001F4E6 *{md(label)}*\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u25B8 Items \u2014 {len(items)}\n"
         f"\u25B8 Expires \u2014 {expires}\n"
         f"\u25B8 Downloads \u2014 {downloads_str}\n"
-        f"\u25B8 Code \u2014 {code}\n"
-        f"\u25B8 \U0001F517 t.me/{bot_username}?start={code}\n"
+        f"\u25B8 Code \u2014 {md(code)}\n"
+        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"Open this share? \u2193"
     )
@@ -183,14 +183,14 @@ def build_management_card(session: dict, bot_username: str, saved: bool = False)
     items = db.get_items(session["id"])
     code = session["code"]
     label = session["label"] or "Untitled"
-    header = f"\u2705 *{label} saved*" if saved else f"\U0001F4E6 *{label}*"
+    header = f"\u2705 *{md(label)} saved*" if saved else f"\U0001F4E6 *{md(label)}*"
 
     text = (
         f"{header}\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"\u25B8 Items \u2014 {len(items)}\n"
-        f"\u25B8 Code \u2014 {code}\n"
-        f"\u25B8 \U0001F517 t.me/{bot_username}?start={code}\n"
+        f"\u25B8 Code \u2014 {md(code)}\n"
+        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         f"Share the link, or manage it below \u2193"
     )
@@ -243,11 +243,11 @@ async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lock_str = "yes" if session["password_hash"] else "no"
     await query.message.reply_text(
         f"\u2139\ufe0f *Session Info*\n\n"
-        f"Code: `{session['code']}`\n"
-        f"Label: {session['label'] or '(none)'}\n"
-        f"Description: {session['description'] or '(none)'}\n"
+        f"Code: `{code}`\n"
+        f"Label: {md(session['label']) if session['label'] else '(none)'}\n"
+        f"Description: {md(session['description']) if session['description'] else '(none)'}\n"
         f"Items: {len(items)}\n"
-        f"Tags: {', '.join(tags) or '(none)'}\n"
+        f"Tags: {md(', '.join(tags)) if tags else '(none)'}\n"
         f"Password protected: {lock_str}\n"
         f"Downloads used: {limit_str}\n"
         f"Expires: {session['expires_at'] or 'never'}\n"
