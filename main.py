@@ -43,11 +43,7 @@ HELP_TEXT = """
 \U0001F4E5 Cap downloads (1 = one-time) \u2013 /limit <code> <number|off>
 \U0001F3F7\ufe0f Tag a session \u2013 /tag <code> <tag1> [tag2 ...]
 \U0001F9F9 Clear tags \u2013 /untag <code>
-\u2699\ufe0f Your preferences \u2013 /settings
-\U0001F4AC Captions on/off \u2013 /togglecaptions
-\U0001F5BC\ufe0f Album grouping on/off \u2013 /togglealbum
-\U0001F501 Photo dedup on/off (active session) \u2013 /toggledupphotos
-\U0001F501 Document dedup on/off (active session) \u2013 /toggledupdocs
+\u2699\ufe0f Your preferences (tap to toggle) \u2013 /settings
 \u2753 This list \u2013 /help
 """.strip()
 
@@ -72,10 +68,6 @@ BOT_COMMANDS = [
     BotCommand("tag", "Tag a session"),
     BotCommand("untag", "Clear tags"),
     BotCommand("settings", "Your preferences"),
-    BotCommand("togglecaptions", "Captions on/off"),
-    BotCommand("togglealbum", "Album grouping on/off"),
-    BotCommand("toggledupphotos", "Photo dedup on/off (active session)"),
-    BotCommand("toggledupdocs", "Document dedup on/off (active session)"),
     BotCommand("help", "All commands"),
 ]
 
@@ -95,6 +87,17 @@ async def open_code_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Send /open <code>, or just paste a code starting with {FILE_CODE_PREFIX}"
     )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "\u26A0\ufe0f Something went wrong handling that. Check the Render logs for details."
+            )
+        except Exception:
+            pass  # if even the error notice fails to send, don't loop
 
 
 @restricted
@@ -145,6 +148,7 @@ def main():
     threading.Thread(target=run_web_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_error_handler(error_handler)
 
     # session lifecycle
     app.add_handler(CommandHandler("start", session.start))
@@ -200,6 +204,10 @@ def main():
         filters.TEXT & ~filters.COMMAND & filters.Regex(re.compile(rf"^{re.escape(FILE_CODE_PREFIX)}", re.IGNORECASE)),
         items.auto_open,
     ))
+    # Any other plain text -- saved as a text item in the active session,
+    # if enabled in Settings. Registered after auto_open so codes are still
+    # caught first.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, items.handle_text_message))
     # Inline Open / Cancel buttons on the recipient-facing share card.
     app.add_handler(CallbackQueryHandler(items.open_share_callback, pattern=r"^open_share:"))
     app.add_handler(CallbackQueryHandler(items.cancel_share_callback, pattern=r"^cancel_share$"))
@@ -211,10 +219,7 @@ def main():
 
     # settings
     app.add_handler(CommandHandler("settings", settings.settings))
-    app.add_handler(CommandHandler("togglecaptions", settings.toggle_captions))
-    app.add_handler(CommandHandler("togglealbum", settings.toggle_album))
-    app.add_handler(CommandHandler("toggledupphotos", settings.toggle_dedup_photos))
-    app.add_handler(CommandHandler("toggledupdocs", settings.toggle_dedup_documents))
+    app.add_handler(CallbackQueryHandler(settings.toggle_setting_callback, pattern=r"^setting:"))
 
     app.add_handler(CommandHandler("help", help_command))
 
