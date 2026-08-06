@@ -2,6 +2,7 @@ from urllib.parse import quote
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
+from telegram.error import TimedOut
 
 import db
 from config import VAULT_CHANNEL_ID
@@ -63,8 +64,19 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Forward the actual bytes into the private vault channel so the file
     # survives even if this bot / this chat is later deleted or banned.
+    # Retry up to 2 times if the upload times out under load.
     send = getattr(context.bot, SEND_METHOD[file_type])
-    vault_message = await send(chat_id=VAULT_CHANNEL_ID, **{file_type: file_id}, caption=caption)
+    vault_message = None
+    for attempt in range(3):  # try up to 3 times (initial + 2 retries)
+        try:
+            vault_message = await send(chat_id=VAULT_CHANNEL_ID, **{file_type: file_id}, caption=caption)
+            break  # success, stop retrying
+        except TimedOut:
+            if attempt == 2:  # final attempt
+                await message.reply_text("\u26A0\ufe0f Upload timed out — file too large or connection too slow. Try again later.")
+                return
+            # retry silently on attempt 0 and 1
+            await message.reply_text(f"\u23F3 Retry {attempt + 1}/2 — upload timed out, trying again...")
 
     db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, file_type, caption, file_unique_id)
     await message.reply_text("\u2705 Saved to current session.")
