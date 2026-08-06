@@ -586,7 +586,6 @@ def _file_ext(file_type: str) -> str:
 
 @restricted
 async def zip_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/zip <code> — bundle all files in a session into a ZIP archive."""
     if not context.args:
         await update.message.reply_text("Usage: /zip <code>")
         return
@@ -670,7 +669,53 @@ async def _send_clean_page(update: Update, context: ContextTypes.DEFAULT_TYPE, s
     keyboard_rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu:root")])
     text = "\n".join(text_lines)
 
-    # Edit if called from callback, otherwise reply
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            text, parse_mode="
+            text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard_rows)
+        )
+    else:
+        await update.effective_message.reply_text(
+            text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard_rows)
+        )
+
+
+@restricted
+async def clean_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /clean <code>")
+        return
+    code = context.args[0]
+    owner_id = update.effective_user.id
+    session = db.get_session_by_code(code)
+    if not session or session["owner_id"] != owner_id:
+        await update.message.reply_text("Session not found.")
+        return
+    await _send_clean_page(update, context, session, code, page=1)
+
+
+@restricted
+async def clean_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, code, item_id_str = query.data.split(":", 2)
+    owner_id = update.effective_user.id
+    session = db.get_session_by_code(code)
+    if not session or session["owner_id"] != owner_id:
+        await query.message.reply_text("Session not found.")
+        return
+
+    db.delete_item(int(item_id_str))
+    await _send_clean_page(update, context, session, code, page=1)
+
+
+@restricted
+async def clean_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, code, page_str = query.data.split(":", 2)
+    owner_id = update.effective_user.id
+    session = db.get_session_by_code(code)
+    if not session or session["owner_id"] != owner_id:
+        await query.message.reply_text("Session not found.")
+        return
+    await _send_clean_page(update, context, session, code, int(page_str))
