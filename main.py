@@ -28,25 +28,27 @@ logger = logging.getLogger(__name__)
 HELP_TEXT = """
 *Ghost's Inventory (personal build) – all commands*
 
-\U0001F47B Main menu \u2013 /start
-\U0001F4E5 Start a storage session \u2013 /create [label]
-\U0001F6D1 Finish the session \u2013 /stop
-\U0001F4C1 Retrieve files by code \u2013 /open <code> [password]
-\U0001F4E6 Your sessions \u2013 /list
-\U0001F50D Find sessions by label/tag \u2013 /search <term>
-\u2139\ufe0f Share details & stats \u2013 /share <code>
-\u2795 Reopen a session to add more \u2013 /edit <code>
-\u270F\ufe0f Rename active session \u2013 /label <code> <new label>
-\u23F1\ufe0f Set expiry \u2013 /duration <code> <24h|7d|30d|90d|off>
-\U0001F5D1\ufe0f Delete a session \u2013 /delete <code>
-\u2796 Remove one item (reply to it) \u2013 /remove
-\U0001F512 Password-protect a share \u2013 /lock <code> <password>
-\U0001F513 Remove the password \u2013 /unlock <code>
-\U0001F4E5 Cap downloads (1 = one-time) \u2013 /limit <code> <number|off>
-\U0001F3F7\ufe0f Tag a session \u2013 /tag <code> <tag1> [tag2 ...]
-\U0001F9F9 Clear tags \u2013 /untag <code>
-\u2699\ufe0f Your preferences (tap to toggle) \u2013 /settings
-\u2753 This list \u2013 /help
+👻 Main menu – /start
+📥 Start a storage session – /create [label]
+🛑 Finish the session – /stop
+📁 Retrieve files by code – /open <code> [password]
+📦 Your sessions – /list
+🔍 Find sessions by label/tag – /search <term>
+ℹ️ Share details & stats – /share <code>
+➕ Reopen a session to add more – /edit <code>
+✏️ Rename active session – /label <code> <new label>
+⏱ Set expiry – /duration <code> <24h|7d|30d|90d|off>
+🗑 Delete a session – /delete <code>
+➖ Remove one item (reply to it) – /remove
+🔒 Password-protect a share – /lock <code> <password>
+🔓 Remove the password – /unlock <code>
+📥 Cap downloads (1 = one-time) – /limit <code> <number|off>
+🏷 Tag a session – /tag <code> <tag1> [tag2 ...]
+🧹 Clear tags – /untag <code>
+⚙️ Your preferences (tap to toggle) – /settings
+📦 Download session as ZIP – /zip <code>
+🧹 Bulk delete items – /clean <code>
+❓ This list – /help
 """.strip()
 
 BOT_COMMANDS = [
@@ -68,13 +70,14 @@ BOT_COMMANDS = [
     BotCommand("limit", "Cap downloads (1 = one-time)"),
     BotCommand("tag", "Tag a session"),
     BotCommand("untag", "Clear tags"),
+    BotCommand("zip", "Download session as ZIP"),
+    BotCommand("clean", "Bulk delete items from session"),
     BotCommand("settings", "Your preferences"),
     BotCommand("help", "All commands"),
 ]
 
 
 async def post_init(app: Application):
-    # Populates the "/" command menu Telegram shows in the chat window.
     await app.bot.set_my_commands(BOT_COMMANDS)
 
 
@@ -83,10 +86,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
-                "\u26A0\ufe0f Something went wrong handling that. Check the Render logs for details."
+                "⚠️ Something went wrong handling that. Check the Render logs for details."
             )
         except Exception:
-            pass  # if even the error notice fails to send, don't loop
+            pass
 
 
 @restricted
@@ -103,8 +106,6 @@ async def open_code_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the main menu's inline buttons (except 'New Upload', which is
-    a ConversationHandler entry point registered separately)."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -123,11 +124,6 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- keep-alive web server ----------
-# Render's free instance type only exists for Web Services (not Background
-# Workers), and free Web Services spin down after 15 minutes with no inbound
-# HTTP traffic. This tiny Flask app gives Render something to route to, and
-# an external pinger (e.g. UptimeRobot hitting "/" every ~10 min) keeps the
-# service awake so the bot's polling loop keeps running.
 web_app = Flask(__name__)
 
 
@@ -144,13 +140,8 @@ def run_web_server():
 def main():
     db.init_db()
 
-    # Flask runs in a background thread; the bot's polling loop owns the
-    # main thread below.
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    # Custom HTTP timeouts: python-telegram-bot's defaults are tight (a few
-    # seconds), which causes TimedOut errors when relaying larger videos to
-    # the vault channel under load. These give uploads 60 seconds to complete.
     request = HTTPXRequest(
         connect_timeout=30,
         read_timeout=60,
@@ -175,8 +166,7 @@ def main():
     app.add_handler(CommandHandler("tag", session.tag))
     app.add_handler(CommandHandler("untag", session.untag))
 
-    # /create as a name -> description -> confirm conversation. Also
-    # reachable by tapping "New Upload" on the main menu.
+    # /create conversation
     create_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("create", session.create_start),
@@ -205,29 +195,29 @@ def main():
 
     # items
     app.add_handler(CommandHandler("remove", items.remove))
+    app.add_handler(CommandHandler("zip", items.zip_download))
+    app.add_handler(CommandHandler("clean", items.clean_start))
     app.add_handler(MessageHandler(
         filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION | filters.AUDIO | filters.VOICE,
         items.handle_upload,
     ))
-    # Paste a code directly (e.g. "FILEQQ_7K3XM9QT") without typing /open first.
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(re.compile(rf"^{re.escape(FILE_CODE_PREFIX)}", re.IGNORECASE)),
         items.auto_open,
     ))
-    # Any other plain text -- saved as a text item in the active session,
-    # if enabled in Settings. Registered after auto_open so codes are still
-    # caught first.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, items.handle_text_message))
-    # Inline Open / Cancel buttons on the recipient-facing share card.
+    
+    # inline buttons
     app.add_handler(CallbackQueryHandler(items.open_share_callback, pattern=r"^open_share:"))
     app.add_handler(CallbackQueryHandler(items.cancel_share_callback, pattern=r"^cancel_share$"))
-    # Buttons on the owner-facing management card (My Cloud, /share, /create, /stop).
     app.add_handler(CallbackQueryHandler(items.card_view_callback, pattern=r"^card_view:"))
     app.add_handler(CallbackQueryHandler(items.card_info_callback, pattern=r"^card_info:"))
     app.add_handler(CallbackQueryHandler(items.card_edit_callback, pattern=r"^card_edit:"))
     app.add_handler(CallbackQueryHandler(items.card_delete_callback, pattern=r"^card_delete:"))
-    # Pagination buttons on delivery.
     app.add_handler(CallbackQueryHandler(items.page_callback, pattern=r"^page:"))
+    app.add_handler(CallbackQueryHandler(items.filter_callback, pattern=r"^filter:"))
+    app.add_handler(CallbackQueryHandler(items.clean_callback, pattern=r"^clean_del:"))
+    app.add_handler(CallbackQueryHandler(items.clean_page_callback, pattern=r"^clean_page:"))
     app.add_handler(CallbackQueryHandler(items.noop_callback, pattern=r"^noop$"))
 
     # settings
@@ -235,8 +225,6 @@ def main():
     app.add_handler(CallbackQueryHandler(settings.toggle_setting_callback, pattern=r"^setting:"))
 
     app.add_handler(CommandHandler("help", help_command))
-
-    # Main menu's inline buttons (New Upload is handled by create_conversation above).
     app.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu:(cloud|profile|opencode|settings|help|root)$"))
 
     logger.info("Bot starting...")
