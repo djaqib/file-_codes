@@ -42,9 +42,9 @@ def init_db():
             owner_id        BIGINT NOT NULL,
             code            TEXT UNIQUE NOT NULL,
             label           TEXT,
-            status          TEXT NOT NULL DEFAULT 'open',  -- open | closed
+            status          TEXT NOT NULL DEFAULT 'open',
             password_hash   TEXT,
-            download_limit  INTEGER,                       -- NULL = unlimited
+            download_limit  INTEGER,
             downloads_used  INTEGER NOT NULL DEFAULT 0,
             expires_at      TIMESTAMPTZ,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -56,8 +56,8 @@ def init_db():
             session_id       INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
             vault_chat_id    BIGINT NOT NULL,
             vault_message_id BIGINT NOT NULL,
-            file_type        TEXT NOT NULL,   -- photo | video | document | animation | audio
-            file_unique_id   TEXT,            -- Telegram's stable per-file identifier, used for dedup
+            file_type        TEXT NOT NULL,
+            file_unique_id   TEXT,
             caption          TEXT,
             added_at         TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -87,16 +87,27 @@ def init_db():
         );
         """)
 
-        # Migration-safe: these columns were added after the tables above
-        # were first created in production, so CREATE TABLE IF NOT EXISTS
-        # alone won't add them to an already-existing table.
+        # --- v2 features: new columns & tables (safe to re-run) ---
+        cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS file_id TEXT;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS delivered_items (
+                id SERIAL PRIMARY KEY,
+                item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                chat_id BIGINT NOT NULL,
+                delivered_message_id BIGINT NOT NULL,
+                delivered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_delivered_lookup ON delivered_items(chat_id, delivered_message_id);")
+        cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS global_dedup_enabled BOOLEAN NOT NULL DEFAULT FALSE;")
+
+        # Original migration-safe additions
         cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS file_unique_id TEXT;")
         cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS description TEXT;")
         cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS dedup_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
         cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_photos_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
         cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_text_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
         cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS accept_documents_enabled BOOLEAN NOT NULL DEFAULT TRUE;")
-        # Superseded by the single dedup_enabled toggle above.
         cur.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS dedup_photos_enabled;")
         cur.execute("ALTER TABLE user_settings DROP COLUMN IF EXISTS dedup_documents_enabled;")
 
@@ -258,12 +269,12 @@ def increment_downloads(session_id: int):
 
 # ---------- items ----------
 
-def add_item(session_id: int, vault_chat_id: int, vault_message_id: int, file_type: str, caption: str | None, file_unique_id: str | None = None):
+def add_item(session_id: int, vault_chat_id: int, vault_message_id: int, file_type: str, caption: str | None, file_unique_id: str | None = None, file_id: str | None = None):
     with get_cursor(commit=True) as cur:
         cur.execute(
-            """INSERT INTO items (session_id, vault_chat_id, vault_message_id, file_type, caption, file_unique_id)
-               VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
-            (session_id, vault_chat_id, vault_message_id, file_type, caption, file_unique_id),
+            """INSERT INTO items (session_id, vault_chat_id, vault_message_id, file_type, caption, file_unique_id, file_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+            (session_id, vault_chat_id, vault_message_id, file_type, caption, file_unique_id, file_id),
         )
         return cur.fetchone()
 
@@ -287,8 +298,6 @@ def get_item_by_vault_message(vault_message_id: int) -> dict | None:
 
 
 def is_duplicate_in_session(session_id: int, file_unique_id: str) -> bool:
-    """Checks for this exact file within THIS session only -- dedup never
-    looks across sessions, past or present."""
     if not file_unique_id:
         return False
     with get_cursor() as cur:
@@ -297,6 +306,58 @@ def is_duplicate_in_session(session_id: int, file_unique_id: str) -> bool:
             (session_id, file_unique_id),
         )
         return cur.fetchone() is not None
+
+
+# ---------- NEW v2 item helpers ----------
+
+def add_delivered_item(item_id: int, chat_id: int, delivered_message_id: int):
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            """INSERT INTO delivered_items (item_id, chat_id, delivered_message_id)
+               VALUES (%s, %s, %s)
+               ON CONFLICT DO NOTHING""",
+            (item_id, chat_id, delivered_message_id),
+        )
+
+
+def get_item_by_delivery(chat_id: int, delivered_message_id: int) -> dict | None:
+    with get_cursor() as cur:
+        cur.execute(
+            """SELECT i.* FROM items i
+               JOIN delivered_items d ON d.item_id = i.id
+               WHERE d.chat_id = %s AND d.delivered_message_id = %s""",
+            (chat_id, delivered_message_id),
+        )
+        return cur.fetchone()
+
+
+def is_duplicate_globally(owner_id: int, file_unique_id: str) -> bool:
+    if not file_unique_id:
+        return False
+    with get_cursor() as cur:
+        cur.execute(
+            """SELECT 1 FROM items i
+               JOIN sessions s ON s.id = i.session_id
+               WHERE s.owner_id = %s AND i.file_unique_id = %s
+               LIMIT 1""",
+            (owner_id, file_unique_id),
+        )
+        return cur.fetchone() is not None
+
+
+def get_items_by_type(session_id: int, file_type: str | None) -> list:
+    with get_cursor() as cur:
+        if file_type and file_type != "all":
+            cur.execute(
+                "SELECT * FROM items WHERE session_id = %s AND file_type = %s ORDER BY added_at",
+                (session_id, file_type),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM items WHERE session_id = %s ORDER BY added_at",
+                (session_id,),
+            )
+        return cur.fetchall()
 
 
 # ---------- tags ----------
@@ -378,4 +439,17 @@ def toggle_accept_documents(user_id: int) -> bool:
     new_val = not settings["accept_documents_enabled"]
     with get_cursor(commit=True) as cur:
         cur.execute("UPDATE user_settings SET accept_documents_enabled = %s WHERE user_id = %s", (new_val, user_id))
+    return new_val
+
+
+# ---------- NEW v2 settings helper ----------
+
+def toggle_global_dedup(user_id: int) -> bool:
+    settings = get_settings(user_id)
+    new_val = not settings["global_dedup_enabled"]
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "UPDATE user_settings SET global_dedup_enabled = %s WHERE user_id = %s",
+            (new_val, user_id),
+        )
     return new_val
