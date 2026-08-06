@@ -442,8 +442,6 @@ def toggle_accept_documents(user_id: int) -> bool:
     return new_val
 
 
-# ---------- NEW v2 settings helper ----------
-
 def toggle_global_dedup(user_id: int) -> bool:
     settings = get_settings(user_id)
     new_val = not settings["global_dedup_enabled"]
