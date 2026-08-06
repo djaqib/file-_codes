@@ -5,6 +5,8 @@ import threading
 
 from flask import Flask
 from telegram import Update, BotCommand
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 HELP_TEXT = """
-*Ghost's Inventory (personal build) \u2013 all commands*
+*Ghost's Inventory (personal build) – all commands*
 
 \U0001F47B Main menu \u2013 /start
 \U0001F4E5 Start a storage session \u2013 /create [label]
@@ -46,7 +48,6 @@ HELP_TEXT = """
 \u2699\ufe0f Your preferences (tap to toggle) \u2013 /settings
 \u2753 This list \u2013 /help
 """.strip()
-
 
 BOT_COMMANDS = [
     BotCommand("start", "Main menu"),
@@ -77,6 +78,17 @@ async def post_init(app: Application):
     await app.bot.set_my_commands(BOT_COMMANDS)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "\u26A0\ufe0f Something went wrong handling that. Check the Render logs for details."
+            )
+        except Exception:
+            pass  # if even the error notice fails to send, don't loop
+
+
 @restricted
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(HELP_TEXT, parse_mode="Markdown")
@@ -87,17 +99,6 @@ async def open_code_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Send /open <code>, or just paste a code starting with {FILE_CODE_PREFIX}"
     )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Unhandled exception", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "\u26A0\ufe0f Something went wrong handling that. Check the Render logs for details."
-            )
-        except Exception:
-            pass  # if even the error notice fails to send, don't loop
 
 
 @restricted
@@ -147,7 +148,16 @@ def main():
     # main thread below.
     threading.Thread(target=run_web_server, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # Custom HTTP timeouts: python-telegram-bot's defaults are tight (a few
+    # seconds), which causes TimedOut errors when relaying larger videos to
+    # the vault channel under load. These give uploads 60 seconds to complete.
+    request = HTTPXRequest(
+        connect_timeout=30,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=30,
+    )
+    app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
     app.add_error_handler(error_handler)
 
     # session lifecycle
@@ -216,6 +226,9 @@ def main():
     app.add_handler(CallbackQueryHandler(items.card_info_callback, pattern=r"^card_info:"))
     app.add_handler(CallbackQueryHandler(items.card_edit_callback, pattern=r"^card_edit:"))
     app.add_handler(CallbackQueryHandler(items.card_delete_callback, pattern=r"^card_delete:"))
+    # Pagination buttons on delivery.
+    app.add_handler(CallbackQueryHandler(items.page_callback, pattern=r"^page:"))
+    app.add_handler(CallbackQueryHandler(items.noop_callback, pattern=r"^noop$"))
 
     # settings
     app.add_handler(CommandHandler("settings", settings.settings))
