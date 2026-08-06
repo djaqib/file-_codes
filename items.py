@@ -20,7 +20,7 @@ SEND_METHOD = {
 
 PAGE_SIZE = 10
 JUMP_SIZE = 30
-FLOOD_DELAY = 3.5  # seconds to wait between API calls to avoid flood control
+FLOOD_DELAY = 10  # seconds to wait between API calls to avoid flood control
 
 
 async def _reply(update: Update, text: str, **kwargs):
