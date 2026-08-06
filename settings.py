@@ -6,23 +6,24 @@ from utils import restricted
 
 
 def _mark(value: bool) -> str:
-    return "\u2705" if value else "\u274C"
+    return "✅" if value else "❌"
 
 
 def build_settings_card(s: dict):
     text = (
-        "\u2699\ufe0f *Settings*\n"
-        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "⚙️ *Settings*\n"
+        "──────────\n\n"
         "Tap to toggle:"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{_mark(s['captions_enabled'])} Captions", callback_data="setting:captions")],
         [InlineKeyboardButton(f"{_mark(s['album_grouping'])} Album grouping", callback_data="setting:album")],
-        [InlineKeyboardButton(f"{_mark(s['dedup_enabled'])} Dedup (active session, all files)", callback_data="setting:dedup")],
+        [InlineKeyboardButton(f"{_mark(s['dedup_enabled'])} Dedup (active session)", callback_data="setting:dedup")],
+        [InlineKeyboardButton(f"{_mark(s['global_dedup_enabled'])} Global dedup (all sessions)", callback_data="setting:globaldedup")],
         [InlineKeyboardButton(f"{_mark(s['accept_photos_enabled'])} Accept photos", callback_data="setting:acceptphotos")],
         [InlineKeyboardButton(f"{_mark(s['accept_text_enabled'])} Accept text messages", callback_data="setting:accepttext")],
         [InlineKeyboardButton(f"{_mark(s['accept_documents_enabled'])} Accept documents", callback_data="setting:acceptdocs")],
-        [InlineKeyboardButton("\u25C0 Menu", callback_data="menu:root")],
+        [InlineKeyboardButton("◀ Menu", callback_data="menu:root")],
     ])
     return text, keyboard
 
@@ -38,6 +39,7 @@ TOGGLE_FUNCS = {
     "captions": db.toggle_captions,
     "album": db.toggle_album,
     "dedup": db.toggle_dedup,
+    "globaldedup": db.toggle_global_dedup,
     "acceptphotos": db.toggle_accept_photos,
     "accepttext": db.toggle_accept_text,
     "acceptdocs": db.toggle_accept_documents,
@@ -46,8 +48,6 @@ TOGGLE_FUNCS = {
 
 @restricted
 async def toggle_setting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when any toggle row on the settings card is tapped -- flips
-    that one setting and refreshes the card in place."""
     query = update.callback_query
     await query.answer()
     key = query.data.split(":", 1)[1]
