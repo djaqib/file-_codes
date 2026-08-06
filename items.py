@@ -1,8 +1,9 @@
+import asyncio
 from urllib.parse import quote
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-from telegram.error import TimedOut
+from telegram.error import TimedOut, RetryAfter
 
 import db
 from config import VAULT_CHANNEL_ID
@@ -19,14 +20,7 @@ SEND_METHOD = {
 
 PAGE_SIZE = 10
 JUMP_SIZE = 30
-
-
-def _reply(update: Update, text: str, **kwargs):
-    """Works whether this update came from a regular message or a button tap."""
-    if update.callback_query:
-        return update.callback_query.message.reply_text(text, **kwargs)
-    else:
-        return update.message.reply_text(text, **kwargs)
+FLOOD_DELAY = 3.5  # seconds to wait between API calls to avoid flood control
 
 
 async def _reply(update: Update, text: str, **kwargs):
@@ -45,7 +39,7 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
     file_type, file_id, file_unique_id = file_type_and_id(message)
-    if not file_id:
+    if not file_type:
         return  # not a file we handle -- ignore silently
 
     settings = db.get_settings(owner_id)
@@ -75,7 +69,7 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Forward the actual bytes into the private vault channel so the file
     # survives even if this bot / this chat is later deleted or banned.
-    # Retry up to 2 times if the upload times out under load.
+    # Retry up to 2 times if the upload times out under load, with delays.
     send = getattr(context.bot, SEND_METHOD[file_type])
     vault_message = None
     for attempt in range(3):  # try up to 3 times (initial + 2 retries)
@@ -86,8 +80,16 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if attempt == 2:  # final attempt
                 await message.reply_text("\u26A0\ufe0f Upload timed out — file too large or connection too slow. Try again later.")
                 return
-            # retry silently on attempt 0 and 1
-            await message.reply_text(f"\u23F3 Retry {attempt + 1}/2 — upload timed out, trying again...")
+            # retry with delay on attempt 0 and 1
+            await message.reply_text(f"\u23F3 Retry {attempt + 1}/2 — upload timed out, waiting before retry...")
+            await asyncio.sleep(5)  # wait 5 seconds before retrying
+        except RetryAfter as e:
+            # Telegram flood control -- back off and retry
+            wait_time = e.retry_after + 1
+            await message.reply_text(f"\u23F3 Rate limited — waiting {wait_time}s before retry...")
+            await asyncio.sleep(wait_time)
+            vault_message = await send(chat_id=VAULT_CHANNEL_ID, **{file_type: file_id}, caption=caption)
+            break
 
     db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, file_type, caption, file_unique_id)
     await message.reply_text("\u2705 Saved to current session.")
@@ -180,17 +182,33 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
     chunk = all_items[start:start + PAGE_SIZE]
 
     chat_id = update.effective_chat.id
-    for item in chunk:
-        # copy_message (not forward_message) sends a fresh copy with no
-        # "Forwarded from ..." attribution, and caption="" strips any
-        # caption -- so delivered files never reveal the vault channel or
-        # carry captions along with them.
-        await context.bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=item["vault_chat_id"],
-            message_id=item["vault_message_id"],
-            caption="",
-        )
+    for idx, item in enumerate(chunk):
+        # Add delay between items to avoid flood control, but not before first item
+        if idx > 0:
+            await asyncio.sleep(FLOOD_DELAY)
+        
+        try:
+            # copy_message (not forward_message) sends a fresh copy with no
+            # "Forwarded from ..." attribution, and caption="" strips any
+            # caption -- so delivered files never reveal the vault channel or
+            # carry captions along with them.
+            await context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=item["vault_chat_id"],
+                message_id=item["vault_message_id"],
+                caption="",
+            )
+        except RetryAfter as e:
+            # Telegram flood control during delivery
+            wait_time = e.retry_after + 1
+            await _reply(update, f"\u23F3 Rate limited — waiting {wait_time}s before continuing delivery...")
+            await asyncio.sleep(wait_time)
+            await context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=item["vault_chat_id"],
+                message_id=item["vault_message_id"],
+                caption="",
+            )
 
     keyboard = build_pagination_keyboard(code, page, total_pages)
     text = f"Page {page}/{total_pages} \u2014 items {start + 1}\u2013{min(start + PAGE_SIZE, total)} of {total}"
