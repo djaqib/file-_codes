@@ -1,22 +1,19 @@
+import asyncio
 import logging
+import os
 import tempfile
 import zipfile
-import os
-from telegram import InputMediaPhoto, InputMediaVideo
-
-logger = logging.getLogger(__name__)
-ALBUM_TYPES = {"photo", "video"}
-CLEAN_PAGE_SIZE = 6
-import asyncio
 from urllib.parse import quote
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ContextTypes
 from telegram.error import TimedOut, RetryAfter
 
 import db
 from config import VAULT_CHANNEL_ID
 from utils import restricted, file_type_and_id, is_expired, back_to_menu_keyboard, md
+
+logger = logging.getLogger(__name__)
 
 SEND_METHOD = {
     "photo": "send_photo",
@@ -29,11 +26,12 @@ SEND_METHOD = {
 
 PAGE_SIZE = 10
 JUMP_SIZE = 30
-FLOOD_DELAY = 10  # seconds to wait between API calls to avoid flood control
+FLOOD_DELAY = 10
+ALBUM_TYPES = {"photo", "video"}
+CLEAN_PAGE_SIZE = 6
 
 
 async def _reply(update: Update, text: str, **kwargs):
-    """Works whether this update came from a regular message or a button tap."""
     if update.callback_query:
         await update.callback_query.message.reply_text(text, **kwargs)
     else:
@@ -96,7 +94,6 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vault_message = await send(chat_id=VAULT_CHANNEL_ID, **{file_type: file_id}, caption=caption)
             break
 
-    # Extract the vault-side file_id so we can send_media_group / zip later
     vault_file_id = file_id
     if vault_message:
         if file_type == "photo" and vault_message.photo:
@@ -116,38 +113,31 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("✅ Saved to current session.")
 
 
-
 @restricted
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires on plain text that isn't a command and isn't a pasted code --
-    saves it as a text item in the active session, if text uploads are
-    enabled in Settings."""
     owner_id = update.effective_user.id
     message = update.message
     settings = db.get_settings(owner_id)
 
     if not settings["accept_text_enabled"]:
-        return  # quietly ignored so it doesn't clutter the chat
+        return
 
     session = db.get_active_session(owner_id)
     if not session:
         session = db.create_session(owner_id)
         await message.reply_text(
-            f"\U0001F4E5 No open session \u2014 started one automatically "
+            f"📥 No open session — started one automatically "
             f"(code `{session['code']}`). Send /stop when done.",
             parse_mode="Markdown",
         )
 
     vault_message = await context.bot.send_message(chat_id=VAULT_CHANNEL_ID, text=message.text)
     db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, "text", message.text, None)
-    await message.reply_text("\u2705 Saved to current session.")
+    await message.reply_text("✅ Saved to current session.")
 
 
 @restricted
 async def auto_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a plain text message starts with FILE_CODE_PREFIX (or is a
-    bare code the owner pastes). Shows the same confirmation card as /share
-    -- delivery only happens once Open is tapped."""
     code = update.message.text.strip().split()[0]
     await send_share_card(update, context, code)
 
@@ -155,7 +145,6 @@ async def auto_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_pagination_keyboard(code: str, page: int, total_pages: int, file_type: str | None = None) -> InlineKeyboardMarkup | None:
     rows = []
 
-    # Filter bar
     filters = ["all", "photo", "video", "document", "text"]
     filter_buttons = []
     current = file_type or "all"
@@ -166,7 +155,6 @@ def build_pagination_keyboard(code: str, page: int, total_pages: int, file_type:
     if len(filter_buttons) > 3:
         rows.append(filter_buttons[3:])
 
-    # Page nav
     if total_pages > 1:
         nav_row = []
         if page > 1:
@@ -297,6 +285,24 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
 
 
 @restricted
+async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    code = parts[1]
+    page = int(parts[2])
+    file_type = parts[3] if len(parts) > 3 else None
+    session = db.get_session_by_code(code)
+    if not session:
+        await query.message.reply_text("No session found with that code.")
+        return
+    if is_expired(session):
+        await query.message.reply_text("This share has expired.")
+        return
+    await _send_page(update, context, session, code, page, file_type=file_type if file_type != "all" else None)
+
+
+@restricted
 async def filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -312,16 +318,12 @@ async def filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_page(update, context, session, code, int(page_str), file_type=ft)
 
 
-
 @restricted
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The '…' ellipsis button -- purely visual, does nothing."""
     await update.callback_query.answer()
 
 
 async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/open <code> [password] -- called from handlers/session.py:open_code,
-    directly from auto_open, or from the Open button on a share card."""
     if not context.args:
         await _reply(update, "Usage: /open <code> [password]")
         return
@@ -348,8 +350,8 @@ async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update, "This share has hit its download limit.")
         return
 
-    items = db.get_items(session["id"])
-    if not items:
+    items_list = db.get_items(session["id"])
+    if not items_list:
         await _reply(update, "This session has no items.")
         return
 
@@ -358,8 +360,7 @@ async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def build_share_card(session: dict, bot_username: str):
-    """Card layout matching the reference bot: stats + a deep link + Open/Cancel buttons."""
-    items = db.get_items(session["id"])
+    items_list = db.get_items(session["id"])
     code = session["code"]
     label = session["label"] or "Untitled"
     expires = session["expires_at"] or "never"
@@ -367,19 +368,19 @@ def build_share_card(session: dict, bot_username: str):
     downloads_str = f"{session['downloads_used']}/{limit}" if limit else str(session["downloads_used"])
 
     text = (
-        f"\U0001F4E6 *{md(label)}*\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u25B8 Items \u2014 {len(items)}\n"
-        f"\u25B8 Expires \u2014 {expires}\n"
-        f"\u25B8 Downloads \u2014 {downloads_str}\n"
-        f"\u25B8 Code \u2014 {md(code)}\n"
-        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Open this share? \u2193"
+        f"📦 *{md(label)}*\n"
+        f"──────────\n"
+        f"▸ Items — {len(items_list)}\n"
+        f"▸ Expires — {expires}\n"
+        f"▸ Downloads — {downloads_str}\n"
+        f"▸ Code — {md(code)}\n"
+        f"▸ 🔗 t.me/{md(bot_username)}?start={md(code)}\n"
+        f"──────────\n"
+        f"Open this share? ↓"
     )
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("\U0001F4E7 Open", callback_data=f"open_share:{code}"),
-        InlineKeyboardButton("\u274C Cancel", callback_data="cancel_share"),
+        InlineKeyboardButton("📧 Open", callback_data=f"open_share:{code}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_share"),
     ]])
     return text, keyboard
 
@@ -396,7 +397,6 @@ async def send_share_card(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
 
 async def open_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when the Open button on a share card is tapped."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -405,36 +405,33 @@ async def open_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cancel_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when the Cancel button on a share card is tapped."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Cancelled.")
 
 
 def build_management_card(session: dict, bot_username: str, saved: bool = False):
-    """Owner-facing card: Items/Code/Link + Open/Info/Share link/Edit/Delete.
-    Used by /create, /stop, /share, and My Cloud."""
-    items = db.get_items(session["id"])
+    items_list = db.get_items(session["id"])
     code = session["code"]
     label = session["label"] or "Untitled"
-    header = f"\u2705 *{md(label)} saved*" if saved else f"\U0001F4E6 *{md(label)}*"
+    header = f"✅ *{md(label)} saved*" if saved else f"📦 *{md(label)}*"
 
     text = (
         f"{header}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u25B8 Items \u2014 {len(items)}\n"
-        f"\u25B8 Code \u2014 {md(code)}\n"
-        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Share the link, or manage it below \u2193"
+        f"──────────\n"
+        f"▸ Items — {len(items_list)}\n"
+        f"▸ Code — {md(code)}\n"
+        f"▸ 🔗 t.me/{md(bot_username)}?start={md(code)}\n"
+        f"──────────\n"
+        f"Share the link, or manage it below ↓"
     )
     share_url = f"https://t.me/share/url?url={quote(f'https://t.me/{bot_username}?start={code}')}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001F4C1 Open", callback_data=f"open_share:{code}"),
-         InlineKeyboardButton("\u2139\ufe0f Info", callback_data=f"card_info:{code}")],
-        [InlineKeyboardButton("\u2197\ufe0f Share link", url=share_url)],
-        [InlineKeyboardButton("\u270F\ufe0f Edit", callback_data=f"card_edit:{code}"),
-         InlineKeyboardButton("\U0001F5D1\ufe0f Delete", callback_data=f"card_delete:{code}")],
+        [InlineKeyboardButton("📁 Open", callback_data=f"open_share:{code}"),
+         InlineKeyboardButton("ℹ️ Info", callback_data=f"card_info:{code}")],
+        [InlineKeyboardButton("↗️ Share link", url=share_url)],
+        [InlineKeyboardButton("✏️ Edit", callback_data=f"card_edit:{code}"),
+         InlineKeyboardButton("🗑️ Delete", callback_data=f"card_delete:{code}")],
     ])
     return text, keyboard
 
@@ -453,7 +450,6 @@ async def send_management_card(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def card_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a session row is tapped in My Cloud -- shows its management card."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -461,7 +457,6 @@ async def card_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Info is tapped on a management card -- shows full stats."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -470,17 +465,17 @@ async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not session or session["owner_id"] != owner_id:
         await query.message.reply_text("Session not found.")
         return
-    items = db.get_items(session["id"])
+    items_list = db.get_items(session["id"])
     tags = db.get_tags(session["id"])
     limit = session["download_limit"]
     limit_str = f"{session['downloads_used']}/{limit}" if limit else "unlimited"
     lock_str = "yes" if session["password_hash"] else "no"
     await query.message.reply_text(
-        f"\u2139\ufe0f *Session Info*\n\n"
+        f"ℹ️ *Session Info*\n\n"
         f"Code: `{code}`\n"
         f"Label: {md(session['label']) if session['label'] else '(none)'}\n"
         f"Description: {md(session['description']) if session['description'] else '(none)'}\n"
-        f"Items: {len(items)}\n"
+        f"Items: {len(items_list)}\n"
         f"Tags: {md(', '.join(tags)) if tags else '(none)'}\n"
         f"Password protected: {lock_str}\n"
         f"Downloads used: {limit_str}\n"
@@ -491,7 +486,6 @@ async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def card_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Edit is tapped -- reopens the session so more files can be added."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -505,7 +499,6 @@ async def card_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def card_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Delete is tapped -- removes the session and its items."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -515,32 +508,31 @@ async def card_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Session not found.")
         return
     db.delete_session(owner_id, session["id"])
-    await query.edit_message_text(f"\U0001F5D1\ufe0f Deleted `{code}`.", parse_mode="Markdown")
+    await query.edit_message_text(f"🗑️ Deleted `{code}`.", parse_mode="Markdown")
 
 
 async def cloud_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The 'My Cloud' screen -- tap a session to manage it, or go back to the menu."""
     owner_id = update.effective_user.id
     sessions = db.list_sessions(owner_id, limit=50)
 
     rows = []
     for s in sessions:
-        marker = "\U0001F7E2" if s["status"] == "open" else "\u26AA"
+        marker = "🟢" if s["status"] == "open" else "⚪"
         label = s["label"] or "Untitled"
         rows.append([InlineKeyboardButton(f"{marker} {label} ({s['code']})", callback_data=f"card_view:{s['code']}")])
-    rows.append([InlineKeyboardButton("\u25C0 Menu", callback_data="menu:root")])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu:root")])
     keyboard = InlineKeyboardMarkup(rows)
 
     if not sessions:
         text = (
-            "\U0001F4C1 *My Cloud*\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
-            "Nothing here yet \u2014 tap \U0001F4E5 New Upload!"
+            "📁 *My Cloud*\n"
+            "──────────\n\n"
+            "Nothing here yet — tap 📥 New Upload!"
         )
     else:
         text = (
-            "\U0001F4C1 *My Cloud*\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+            "📁 *My Cloud*\n"
+            "──────────\n\n"
             "Tap a session to manage it:"
         )
     await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
@@ -554,15 +546,12 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     reply = message.reply_to_message
-
-    # NEW: look up by delivery record (works on any message this bot sent to this chat)
     item = db.get_item_by_delivery(reply.chat.id, reply.message_id)
     if item:
         db.delete_item(item["id"])
         await message.reply_text("🗑 Removed.")
         return
 
-    # FALLBACK: old forward-origin method (for legacy items delivered before this update)
     forward_origin = message.reply_to_message.forward_origin
     if forward_origin and hasattr(forward_origin, "message_id"):
         item = db.get_item_by_vault_message(forward_origin.message_id)
@@ -572,6 +561,7 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await message.reply_text("Couldn't identify that item. /remove only works on files this bot delivered to you in this chat.")
+
 
 def _file_ext(file_type: str) -> str:
     return {
