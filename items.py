@@ -17,6 +17,17 @@ SEND_METHOD = {
     "voice": "send_voice",
 }
 
+PAGE_SIZE = 10
+JUMP_SIZE = 30
+
+
+def _reply(update: Update, text: str, **kwargs):
+    """Works whether this update came from a regular message or a button tap."""
+    if update.callback_query:
+        return update.callback_query.message.reply_text(text, **kwargs)
+    else:
+        return update.message.reply_text(text, **kwargs)
+
 
 async def _reply(update: Update, text: str, **kwargs):
     """Works whether this update came from a regular message or a button tap."""
@@ -117,6 +128,97 @@ async def auto_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_share_card(update, context, code)
 
 
+def build_pagination_keyboard(code: str, page: int, total_pages: int) -> InlineKeyboardMarkup | None:
+    if total_pages <= 1:
+        return None
+
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("\u25C0", callback_data=f"page:{code}:{page-1}"))
+
+    window = 1  # show current page +/- this many neighbors
+    start = max(1, page - window)
+    end = min(total_pages, page + window)
+
+    if start > 1:
+        nav_row.append(InlineKeyboardButton("1", callback_data=f"page:{code}:1"))
+        if start > 2:
+            nav_row.append(InlineKeyboardButton("\u2026", callback_data="noop"))
+    for p in range(start, end + 1):
+        label = f"\u00B7{p}\u00B7" if p == page else str(p)
+        nav_row.append(InlineKeyboardButton(label, callback_data=f"page:{code}:{p}"))
+    if end < total_pages:
+        if end < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("\u2026", callback_data="noop"))
+        nav_row.append(InlineKeyboardButton(str(total_pages), callback_data=f"page:{code}:{total_pages}"))
+
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("\u25B6", callback_data=f"page:{code}:{page+1}"))
+
+    rows = [nav_row]
+
+    # Only worth showing +/-30 jump buttons once there are enough pages
+    # that a single tap of the neighbor buttons wouldn't get you far.
+    if total_pages > 50:
+        jump_row = []
+        if page > JUMP_SIZE:
+            jump_row.append(InlineKeyboardButton(f"\u00AB{JUMP_SIZE}", callback_data=f"page:{code}:{max(1, page - JUMP_SIZE)}"))
+        if page + JUMP_SIZE <= total_pages:
+            jump_row.append(InlineKeyboardButton(f"{JUMP_SIZE}\u00BB", callback_data=f"page:{code}:{min(total_pages, page + JUMP_SIZE)}"))
+        if jump_row:
+            rows.append(jump_row)
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, code: str, page: int):
+    all_items = db.get_items(session["id"])
+    total = len(all_items)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * PAGE_SIZE
+    chunk = all_items[start:start + PAGE_SIZE]
+
+    chat_id = update.effective_chat.id
+    for item in chunk:
+        # copy_message (not forward_message) sends a fresh copy with no
+        # "Forwarded from ..." attribution, and caption="" strips any
+        # caption -- so delivered files never reveal the vault channel or
+        # carry captions along with them.
+        await context.bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=item["vault_chat_id"],
+            message_id=item["vault_message_id"],
+            caption="",
+        )
+
+    keyboard = build_pagination_keyboard(code, page, total_pages)
+    text = f"Page {page}/{total_pages} \u2014 items {start + 1}\u2013{min(start + PAGE_SIZE, total)} of {total}"
+    await _reply(update, text, reply_markup=keyboard)
+
+
+@restricted
+async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fires when a page-number or +/-30 jump button is tapped."""
+    query = update.callback_query
+    await query.answer()
+    _, code, page_str = query.data.split(":", 2)
+    session = db.get_session_by_code(code)
+    if not session:
+        await query.message.reply_text("No session found with that code.")
+        return
+    if is_expired(session):
+        await query.message.reply_text("This share has expired.")
+        return
+    await _send_page(update, context, session, code, int(page_str))
+
+
+@restricted
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The '…' ellipsis button -- purely visual, does nothing."""
+    await update.callback_query.answer()
+
+
 async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/open <code> [password] -- called from handlers/session.py:open_code,
     directly from auto_open, or from the Open button on a share card."""
@@ -151,21 +253,8 @@ async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply(update, "This session has no items.")
         return
 
-    chat_id = update.effective_chat.id
-    for item in items:
-        # copy_message (not forward_message) sends a fresh copy with no
-        # "Forwarded from ..." attribution, and caption="" strips any
-        # caption -- so delivered files never reveal the vault channel or
-        # carry captions along with them.
-        await context.bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=item["vault_chat_id"],
-            message_id=item["vault_message_id"],
-            caption="",
-        )
-
     db.increment_downloads(session["id"])
-    await _reply(update, f"\u2705 Delivered {len(items)} item(s) from `{code}`.", parse_mode="Markdown")
+    await _send_page(update, context, session, code, page=1)
 
 
 def build_share_card(session: dict, bot_username: str):
@@ -371,8 +460,8 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     forward_origin = message.reply_to_message.forward_origin
     # NOTE: matching a forwarded message back to its vault copy requires the
     # forward_origin's message id, which Telegram only exposes for channel
-    # forwards. This works for items delivered via /open (forwarded from the
-    # vault channel).
+    # forwards. This works for items delivered via /open, but won't match if you
+    # forward the same file again manually.
     if not forward_origin or not hasattr(forward_origin, "message_id"):
         await message.reply_text("Couldn't identify that item. /remove only works on delivered files.")
         return
