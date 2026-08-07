@@ -2,7 +2,7 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 
 import db
-from utils import restricted, parse_duration, back_to_menu_keyboard, md
+from utils import restricted, parse_duration, back_to_menu_keyboard, md, is_expired
 
 MAIN_MENU_CARD_TEXT = (
     "\U0001F47B *GHOST'S STORAGE*\n"
@@ -28,11 +28,24 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Deep link support: tapping a t.me/yourbot?start=CODE link (e.g. from
-    # a share card) arrives here with the code as context.args[0].
+    # Deep link support: tapping a t.me/yourbot?start=CODE link.
+    # FIX: This now works for BOTH owners and recipients. We show the public
+    # share card (Open/Cancel) without the owner-only gate.
     if context.args:
-        from items import send_share_card
-        await send_share_card(update, context, context.args[0])
+        code = context.args[0]
+        session = db.get_session_by_code(code)
+        if not session:
+            await update.effective_message.reply_text("Session not found.")
+            return
+        if is_expired(session):
+            await update.effective_message.reply_text("This share has expired.")
+            return
+        from items import build_share_card
+        bot = await context.bot.get_me()
+        text, keyboard = build_share_card(session, bot.username)
+        await update.effective_message.reply_text(
+            text, parse_mode="Markdown", reply_markup=keyboard
+        )
         return
 
     name = update.effective_user.first_name or "there"
