@@ -369,8 +369,6 @@ async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         raise
 
 
-
-
 def build_share_card(session: dict, bot_username: str):
     """Card layout matching the reference bot: stats + a deep link + Open/Cancel buttons."""
     items = db.get_items(session["id"])
@@ -594,3 +592,38 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.delete_item(item["id"])
     await message.reply_text("\U0001F5D1\ufe0f Removed.")
+
+
+# ---------------------------------------------------------------------------
+# STUBS for features not implemented yet — prevents main.py from crashing on
+# startup. Remove these once you build the real ZIP / clean / filter logic.
+# ---------------------------------------------------------------------------
+
+@restricted
+async def zip_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stub for /zip <code>"""
+    await _reply(update, "\U0001F4E6 ZIP download is not implemented yet.")
+
+
+@restricted
+async def clean_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stub for /clean <code>"""
+    await _reply(update, "\U0001F5D1 Bulk item deletion is not implemented yet.")
+
+
+async def filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stub for filter:* inline buttons."""
+    query = update.callback_query
+    await query.answer("Filters are not implemented yet.")
+
+
+async def clean_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stub for clean_del:* inline buttons."""
+    query = update.callback_query
+    await query.answer("Bulk delete is not implemented yet.")
+
+
+async def clean_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stub for clean_page:* inline buttons."""
+    query = update.callback_query
+    await query.answer("Bulk delete is not implemented yet.")
