@@ -185,6 +185,7 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", session.create_cancel)],
+        per_message=True,  # suppresses PTB warning and properly tracks callback queries
     )
     app.add_handler(create_conversation)
 
