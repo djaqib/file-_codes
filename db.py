@@ -155,6 +155,13 @@ def get_active_session(owner_id: int) -> dict | None:
         return cur.fetchone()
 
 
+def get_session_by_id(session_id: int) -> dict | None:
+    """Fetch a session by its internal primary key."""
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+        return cur.fetchone()
+
+
 def close_active_session(owner_id: int) -> dict | None:
     session = get_active_session(owner_id)
     if not session:
@@ -167,6 +174,12 @@ def close_active_session(owner_id: int) -> dict | None:
 
 def reopen_session(owner_id: int, session_id: int) -> bool:
     with get_cursor(commit=True) as cur:
+        # SECURITY FIX: Close any other open sessions so a user never has
+        # multiple 'open' sessions at once (which breaks /stop and uploads).
+        cur.execute(
+            "UPDATE sessions SET status = 'closed' WHERE owner_id = %s AND status = 'open' AND id != %s",
+            (owner_id, session_id),
+        )
         cur.execute(
             "UPDATE sessions SET status = 'open' WHERE id = %s AND owner_id = %s",
             (session_id, owner_id),
@@ -182,8 +195,9 @@ def reopen_session(owner_id: int, session_id: int) -> bool:
 
 
 def get_session_by_code(code: str) -> dict | None:
+    # FIX: Case-insensitive lookup so mixed-case stored codes always match.
     with get_cursor() as cur:
-        cur.execute("SELECT * FROM sessions WHERE code = %s", (code.strip().upper(),))
+        cur.execute("SELECT * FROM sessions WHERE LOWER(code) = LOWER(%s)", (code.strip(),))
         return cur.fetchone()
 
 
@@ -259,12 +273,19 @@ def set_expiry(owner_id: int, session_id: int, expires_at) -> bool:
         return cur.rowcount > 0
 
 
-def increment_downloads(session_id: int):
+def increment_downloads(session_id: int) -> dict | None:
+    """Atomically increment downloads_used only if under the limit.
+    Returns the updated session row, or None if the limit was already hit."""
     with get_cursor(commit=True) as cur:
         cur.execute(
-            "UPDATE sessions SET downloads_used = downloads_used + 1 WHERE id = %s",
+            """UPDATE sessions
+               SET downloads_used = downloads_used + 1
+               WHERE id = %s
+                 AND (download_limit IS NULL OR downloads_used < download_limit)
+               RETURNING *""",
             (session_id,),
         )
+        return cur.fetchone()
 
 
 # ---------- items ----------
