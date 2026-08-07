@@ -355,15 +355,20 @@ async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         await _reply(update, "This session has no items.")
         return
 
-    # SECURITY FIX: Only increment the download counter AFTER delivery succeeds.
-    # If _send_page raises an exception (flood limit, timeout, etc.), the
-    # download is NOT counted.
+    # ATOMIC download counter: checks limit and increments in one query.
+    # Returns None if the limit was already hit.
+    updated = db.increment_downloads(session["id"])
+    if not updated:
+        await _reply(update, "This share has hit its download limit.")
+        return
+
     try:
         await _send_page(update, context, session, code, page=1)
-        db.increment_downloads(session["id"])
     except Exception:
         await _reply(update, "\u26A0\ufe0f Delivery failed. Please try again later.")
         raise
+
+
 
 
 def build_share_card(session: dict, bot_username: str):
