@@ -20,8 +20,48 @@ SEND_METHOD = {
 
 PAGE_SIZE = 10
 JUMP_SIZE = 30
-FLOOD_DELAY = 3.5  # seconds to wait between API calls to avoid flood control
-ALBUM_DELAY = 0.2  # tiny delay between grouped items for visual grouping
+FLOOD_DELAY = 3.5
+ALBUM_DELAY = 0.2
+
+# ---------- batched upload confirmations (prevents chat flooding) ----------
+UPLOAD_BATCH_DELAY = 2.0  # seconds
+_pending_uploads = {}     # chat_id -> {"count": int, "job": Job | None}
+
+
+async def _send_batched_confirmation(context: ContextTypes.DEFAULT_TYPE):
+    """Send one confirmation message after a brief pause to batch rapid uploads."""
+    chat_id = context.job.data["chat_id"]
+    if chat_id not in _pending_uploads:
+        return
+
+    count = _pending_uploads[chat_id]["count"]
+    del _pending_uploads[chat_id]
+
+    text = f"✅ Saved {count} item{'s' if count > 1 else ''} to current session."
+    await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+def _schedule_upload_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Queue a confirmation instead of replying instantly for every file."""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in _pending_uploads:
+        _pending_uploads[chat_id] = {"count": 0, "job": None}
+
+    _pending_uploads[chat_id]["count"] += 1
+
+    # Cancel any previously scheduled confirmation for this chat
+    if _pending_uploads[chat_id]["job"]:
+        _pending_uploads[chat_id]["job"].schedule_removal()
+
+    # Schedule a new confirmation after the delay
+    job = context.job_queue.run_once(
+        _send_batched_confirmation,
+        UPLOAD_BATCH_DELAY,
+        data={"chat_id": chat_id},
+    )
+    _pending_uploads[chat_id]["job"] = job
+# --------------------------------------------------------------------------
 
 
 async def _reply(update: Update, text: str, **kwargs):
@@ -70,7 +110,6 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Forward the actual bytes into the private vault channel so the file
     # survives even if this bot / this chat is later deleted or banned.
-    # Retry up to 3 times if the upload times out or hits rate limits.
     send = getattr(context.bot, SEND_METHOD[file_type])
     vault_message = None
 
@@ -85,18 +124,17 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(f"\u23F3 Retry {attempt + 1}/2 — upload timed out, waiting before retry...")
             await asyncio.sleep(5)
         except RetryAfter as e:
-            # Telegram flood control -- back off and retry
             wait_time = e.retry_after + 1
             await message.reply_text(f"\u23F3 Rate limited — waiting {wait_time}s before retry...")
             await asyncio.sleep(wait_time)
-            # Loop continues; if this was the last attempt we fall through
 
     if vault_message is None:
         await message.reply_text("\u26A0\ufe0f Upload failed after multiple retries. Please try again later.")
         return
 
     db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, file_type, caption, file_unique_id)
-    await message.reply_text("\u2705 Saved to current session.")
+    # BATCHED: don't flood chat with one message per file
+    _schedule_upload_confirmation(update, context)
 
 
 @restricted
@@ -120,7 +158,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown",
         )
 
-    # SECURITY FIX: Added retry logic for vault text delivery
     vault_message = None
     for attempt in range(3):
         try:
@@ -139,7 +176,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, "text", message.text, None)
-    await message.reply_text("\u2705 Saved to current session.")
+    # BATCHED: don't flood chat with one message per text item
+    _schedule_upload_confirmation(update, context)
 
 
 @restricted
@@ -180,8 +218,6 @@ def build_pagination_keyboard(code: str, page: int, total_pages: int) -> InlineK
 
     rows = [nav_row]
 
-    # Only worth showing +/-30 jump buttons once there are enough pages
-    # that a single tap of the neighbor buttons wouldn't get you far.
     if total_pages > 50:
         jump_row = []
         if page > JUMP_SIZE:
@@ -206,24 +242,17 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
     settings = db.get_settings(owner_id)
     chat_id = update.effective_chat.id
     
-    # When album grouping is on, send consecutive photos/videos with minimal delay
-    # to create the visual grouping effect. When off, use FLOOD_DELAY between all items.
     groupable_types = {"photo", "video"}
     idx = 0
     
     while idx < len(chunk):
         item = chunk[idx]
         
-        # Add flood delay before this item (except the very first one)
         if idx > 0:
             await asyncio.sleep(FLOOD_DELAY)
         
         try:
-            # If album grouping is ON and this is a groupable type (photo/video),
-            # send it and consecutive groupable items with minimal delay between them
-            # (Telegram groups these visually)
             if settings["album_grouping"] and item["file_type"] in groupable_types:
-                # Send this item
                 await context.bot.copy_message(
                     chat_id=chat_id,
                     from_chat_id=item["vault_chat_id"],
@@ -232,8 +261,6 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
                 )
                 idx += 1
                 
-                # SECURITY FIX: Wrapped consecutive groupable items in error handling
-                # so one failed item doesn't crash the entire delivery.
                 while idx < len(chunk) and chunk[idx]["file_type"] in groupable_types:
                     await asyncio.sleep(ALBUM_DELAY)
                     try:
@@ -255,12 +282,11 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
                                 caption="",
                             )
                         except Exception:
-                            pass  # Skip this item if it still fails
+                            pass
                     except TimedOut:
                         await _reply(update, "\u26A0\ufe0f Delivery timed out. Skipping item...")
                     idx += 1
             else:
-                # Not groupable or album grouping is off — send individually
                 await context.bot.copy_message(
                     chat_id=chat_id,
                     from_chat_id=item["vault_chat_id"],
@@ -270,11 +296,9 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
                 idx += 1
                 
         except RetryAfter as e:
-            # Telegram flood control during delivery
             wait_time = e.retry_after + 1
             await _reply(update, f"\u23F3 Rate limited — waiting {wait_time}s before continuing delivery...")
             await asyncio.sleep(wait_time)
-            # SECURITY FIX: Wrapped retry in try/except so a second failure doesn't crash
             try:
                 await context.bot.copy_message(
                     chat_id=chat_id,
@@ -284,9 +308,8 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
                 )
                 idx += 1
             except Exception:
-                idx += 1  # Skip item if it still fails after waiting
+                idx += 1
         except TimedOut:
-            # SECURITY FIX: Added TimedOut handling so slow connections don't kill delivery
             await _reply(update, "\u26A0\ufe0f Delivery timed out. Skipping item...")
             idx += 1
 
@@ -320,9 +343,6 @@ async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str = None, password: str = None):
     """/open <code> [password] -- called from handlers/session.py:open_code,
     directly from auto_open, or from the Open button on a share card.
-    
-    SECURITY FIX: Accepts explicit code/password so we don't have to mutate
-    context.args (which is risky and brittle).
     """
     if code is None:
         if not context.args:
@@ -355,8 +375,6 @@ async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         await _reply(update, "This session has no items.")
         return
 
-    # ATOMIC download counter: checks limit and increments in one query.
-    # Returns None if the limit was already hit.
     updated = db.increment_downloads(session["id"])
     if not updated:
         await _reply(update, "This share has hit its download limit.")
@@ -412,7 +430,6 @@ async def open_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
-    # SECURITY FIX: Pass code explicitly instead of mutating context.args
     await deliver_session(update, context, code=code)
 
 
@@ -570,10 +587,6 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     forward_origin = message.reply_to_message.forward_origin
-    # NOTE: matching a forwarded message back to its vault copy requires the
-    # forward_origin's message id, which Telegram only exposes for channel
-    # forwards. This works for items delivered via /open, but won't match if you
-    # forward the same file again manually.
     if not forward_origin or not hasattr(forward_origin, "message_id"):
         await message.reply_text("Couldn't identify that item. /remove only works on delivered files.")
         return
@@ -583,8 +596,6 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Couldn't find that item in any session.")
         return
 
-    # CRITICAL SECURITY FIX: Verify the user actually owns the session this item
-    # belongs to. Without this, any restricted user could delete anyone's files.
     session = db.get_session_by_id(item["session_id"])
     if not session or session["owner_id"] != update.effective_user.id:
         await message.reply_text("Not authorized to remove this item.")
@@ -595,8 +606,7 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# STUBS for features not implemented yet — prevents main.py from crashing on
-# startup. Remove these once you build the real ZIP / clean / filter logic.
+# STUBS for features not implemented yet
 # ---------------------------------------------------------------------------
 
 @restricted
