@@ -23,49 +23,38 @@ JUMP_SIZE = 30
 FLOOD_DELAY = 3.5
 ALBUM_DELAY = 0.2
 
-# ---------- batched upload confirmations (prevents chat flooding) ----------
-UPLOAD_BATCH_DELAY = 2.0  # seconds
-_pending_uploads = {}     # chat_id -> {"count": int, "job": Job | None}
+# ---------- batched upload confirmations ----------
+UPLOAD_BATCH_DELAY = 2.0
+_pending_uploads = {}
 
 
 async def _send_batched_confirmation(context: ContextTypes.DEFAULT_TYPE):
-    """Send one confirmation message after a brief pause to batch rapid uploads."""
     chat_id = context.job.data["chat_id"]
     if chat_id not in _pending_uploads:
         return
-
     count = _pending_uploads[chat_id]["count"]
     del _pending_uploads[chat_id]
-
     text = f"✅ Saved {count} item{'s' if count > 1 else ''} to current session."
     await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 def _schedule_upload_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Queue a confirmation instead of replying instantly for every file."""
     chat_id = update.effective_chat.id
-
     if chat_id not in _pending_uploads:
         _pending_uploads[chat_id] = {"count": 0, "job": None}
-
     _pending_uploads[chat_id]["count"] += 1
-
-    # Cancel any previously scheduled confirmation for this chat
     if _pending_uploads[chat_id]["job"]:
         _pending_uploads[chat_id]["job"].schedule_removal()
-
-    # Schedule a new confirmation after the delay
     job = context.job_queue.run_once(
         _send_batched_confirmation,
         UPLOAD_BATCH_DELAY,
         data={"chat_id": chat_id},
     )
     _pending_uploads[chat_id]["job"] = job
-# --------------------------------------------------------------------------
+# -----------------------------------------------
 
 
 async def _reply(update: Update, text: str, **kwargs):
-    """Works whether this update came from a regular message or a button tap."""
     if update.callback_query:
         await update.callback_query.message.reply_text(text, **kwargs)
     else:
@@ -74,86 +63,77 @@ async def _reply(update: Update, text: str, **kwargs):
 
 @restricted
 async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires on any incoming photo/video/document/etc. Auto-creates a
-    session if you forgot to /create one first."""
     owner_id = update.effective_user.id
     message = update.message
 
     file_type, file_id, file_unique_id = file_type_and_id(message)
     if not file_type:
-        return  # not a file we handle -- ignore silently
+        return
 
     settings = db.get_settings(owner_id)
 
     if file_type == "photo" and not settings["accept_photos_enabled"]:
-        await message.reply_text("\U0001F6AB Photo uploads are currently disabled in /settings.")
+        await message.reply_text("🚫 Photo uploads are currently disabled in /settings.")
         return
     if file_type == "document" and not settings["accept_documents_enabled"]:
-        await message.reply_text("\U0001F6AB Document uploads are currently disabled in /settings.")
+        await message.reply_text("🚫 Document uploads are currently disabled in /settings.")
         return
 
     session = db.get_active_session(owner_id)
     if not session:
         session = db.create_session(owner_id)
         await message.reply_text(
-            f"\U0001F4E5 No open session \u2014 started one automatically "
+            f"📥 No open session — started one automatically "
             f"(code `{session['code']}`). Send /stop when done.",
             parse_mode="Markdown",
         )
 
-    # Dedup only ever looks within THIS active session.
     if settings["dedup_enabled"] and file_unique_id and db.is_duplicate_in_session(session["id"], file_unique_id):
-        await message.reply_text("\u26A0\ufe0f Duplicate \u2014 already in this session, skipped.")
+        await message.reply_text("⚠️ Duplicate — already in this session, skipped.")
         return
 
     caption = message.caption if settings["captions_enabled"] else None
 
-    # Forward the actual bytes into the private vault channel so the file
-    # survives even if this bot / this chat is later deleted or banned.
     send = getattr(context.bot, SEND_METHOD[file_type])
     vault_message = None
 
     for attempt in range(3):
         try:
             vault_message = await send(chat_id=VAULT_CHANNEL_ID, **{file_type: file_id}, caption=caption)
-            break  # success, stop retrying
+            break
         except TimedOut:
-            if attempt == 2:  # final attempt
-                await message.reply_text("\u26A0\ufe0f Upload timed out — file too large or connection too slow. Try again later.")
+            if attempt == 2:
+                await message.reply_text("⚠️ Upload timed out — file too large or connection too slow. Try again later.")
                 return
-            await message.reply_text(f"\u23F3 Retry {attempt + 1}/2 — upload timed out, waiting before retry...")
+            await message.reply_text(f"⏳ Retry {attempt + 1}/2 — upload timed out, waiting before retry...")
             await asyncio.sleep(5)
         except RetryAfter as e:
             wait_time = e.retry_after + 1
-            await message.reply_text(f"\u23F3 Rate limited — waiting {wait_time}s before retry...")
+            await message.reply_text(f"⏳ Rate limited — waiting {wait_time}s before retry...")
             await asyncio.sleep(wait_time)
 
     if vault_message is None:
-        await message.reply_text("\u26A0\ufe0f Upload failed after multiple retries. Please try again later.")
+        await message.reply_text("⚠️ Upload failed after multiple retries. Please try again later.")
         return
 
     db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, file_type, caption, file_unique_id)
-    # BATCHED: don't flood chat with one message per file
     _schedule_upload_confirmation(update, context)
 
 
 @restricted
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires on plain text that isn't a command and isn't a pasted code --
-    saves it as a text item in the active session, if text uploads are
-    enabled in Settings."""
     owner_id = update.effective_user.id
     message = update.message
     settings = db.get_settings(owner_id)
 
     if not settings["accept_text_enabled"]:
-        return  # quietly ignored so it doesn't clutter the chat
+        return
 
     session = db.get_active_session(owner_id)
     if not session:
         session = db.create_session(owner_id)
         await message.reply_text(
-            f"\U0001F4E5 No open session \u2014 started one automatically "
+            f"📥 No open session — started one automatically "
             f"(code `{session['code']}`). Send /stop when done.",
             parse_mode="Markdown",
         )
@@ -165,26 +145,22 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             break
         except TimedOut:
             if attempt == 2:
-                await message.reply_text("\u26A0\ufe0f Upload timed out. Please try again later.")
+                await message.reply_text("⚠️ Upload timed out. Please try again later.")
                 return
             await asyncio.sleep(2)
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 1)
 
     if vault_message is None:
-        await message.reply_text("\u26A0\ufe0f Failed to save text. Please try again.")
+        await message.reply_text("⚠️ Failed to save text. Please try again.")
         return
 
     db.add_item(session["id"], VAULT_CHANNEL_ID, vault_message.message_id, "text", message.text, None)
-    # BATCHED: don't flood chat with one message per text item
     _schedule_upload_confirmation(update, context)
 
 
 @restricted
 async def auto_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a plain text message starts with FILE_CODE_PREFIX (or is a
-    bare code the owner pastes). Shows the same confirmation card as /share
-    -- delivery only happens once Open is tapped."""
     code = update.message.text.strip().split()[0]
     await send_share_card(update, context, code)
 
@@ -195,35 +171,35 @@ def build_pagination_keyboard(code: str, page: int, total_pages: int) -> InlineK
 
     nav_row = []
     if page > 1:
-        nav_row.append(InlineKeyboardButton("\u25C0", callback_data=f"page:{code}:{page-1}"))
+        nav_row.append(InlineKeyboardButton("◀", callback_data=f"page:{code}:{page-1}"))
 
-    window = 1  # show current page +/- this many neighbors
+    window = 1
     start = max(1, page - window)
     end = min(total_pages, page + window)
 
     if start > 1:
         nav_row.append(InlineKeyboardButton("1", callback_data=f"page:{code}:1"))
         if start > 2:
-            nav_row.append(InlineKeyboardButton("\u2026", callback_data="noop"))
+            nav_row.append(InlineKeyboardButton("…", callback_data="noop"))
     for p in range(start, end + 1):
-        label = f"\u00B7{p}\u00B7" if p == page else str(p)
+        label = f"·{p}·" if p == page else str(p)
         nav_row.append(InlineKeyboardButton(label, callback_data=f"page:{code}:{p}"))
     if end < total_pages:
         if end < total_pages - 1:
-            nav_row.append(InlineKeyboardButton("\u2026", callback_data="noop"))
+            nav_row.append(InlineKeyboardButton("…", callback_data="noop"))
         nav_row.append(InlineKeyboardButton(str(total_pages), callback_data=f"page:{code}:{total_pages}"))
 
     if page < total_pages:
-        nav_row.append(InlineKeyboardButton("\u25B6", callback_data=f"page:{code}:{page+1}"))
+        nav_row.append(InlineKeyboardButton("▶", callback_data=f"page:{code}:{page+1}"))
 
     rows = [nav_row]
 
     if total_pages > 50:
         jump_row = []
         if page > JUMP_SIZE:
-            jump_row.append(InlineKeyboardButton(f"\u00AB{JUMP_SIZE}", callback_data=f"page:{code}:{max(1, page - JUMP_SIZE)}"))
+            jump_row.append(InlineKeyboardButton(f"«{JUMP_SIZE}", callback_data=f"page:{code}:{max(1, page - JUMP_SIZE)}"))
         if page + JUMP_SIZE <= total_pages:
-            jump_row.append(InlineKeyboardButton(f"{JUMP_SIZE}\u00BB", callback_data=f"page:{code}:{min(total_pages, page + JUMP_SIZE)}"))
+            jump_row.append(InlineKeyboardButton(f"{JUMP_SIZE}»", callback_data=f"page:{code}:{min(total_pages, page + JUMP_SIZE)}"))
         if jump_row:
             rows.append(jump_row)
 
@@ -272,7 +248,7 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
                         )
                     except RetryAfter as e:
                         wait_time = e.retry_after + 1
-                        await _reply(update, f"\u23F3 Rate limited — waiting {wait_time}s before continuing delivery...")
+                        await _reply(update, f"⏳ Rate limited — waiting {wait_time}s before continuing delivery...")
                         await asyncio.sleep(wait_time)
                         try:
                             await context.bot.copy_message(
@@ -284,7 +260,7 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
                         except Exception:
                             pass
                     except TimedOut:
-                        await _reply(update, "\u26A0\ufe0f Delivery timed out. Skipping item...")
+                        await _reply(update, "⚠️ Delivery timed out. Skipping item...")
                     idx += 1
             else:
                 await context.bot.copy_message(
@@ -297,7 +273,7 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
                 
         except RetryAfter as e:
             wait_time = e.retry_after + 1
-            await _reply(update, f"\u23F3 Rate limited — waiting {wait_time}s before continuing delivery...")
+            await _reply(update, f"⏳ Rate limited — waiting {wait_time}s before continuing delivery...")
             await asyncio.sleep(wait_time)
             try:
                 await context.bot.copy_message(
@@ -310,17 +286,16 @@ async def _send_page(update: Update, context: ContextTypes.DEFAULT_TYPE, session
             except Exception:
                 idx += 1
         except TimedOut:
-            await _reply(update, "\u26A0\ufe0f Delivery timed out. Skipping item...")
+            await _reply(update, "⚠️ Delivery timed out. Skipping item...")
             idx += 1
 
     keyboard = build_pagination_keyboard(code, page, total_pages)
-    text = f"Page {page}/{total_pages} \u2014 items {start + 1}\u2013{min(start + PAGE_SIZE, total)} of {total}"
+    text = f"Page {page}/{total_pages} — items {start + 1}–{min(start + PAGE_SIZE, total)} of {total}"
     await _reply(update, text, reply_markup=keyboard)
 
 
 @restricted
 async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a page-number or +/-30 jump button is tapped."""
     query = update.callback_query
     await query.answer()
     _, code, page_str = query.data.split(":", 2)
@@ -336,14 +311,10 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The '…' ellipsis button -- purely visual, does nothing."""
     await update.callback_query.answer()
 
 
 async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str = None, password: str = None):
-    """/open <code> [password] -- called from handlers/session.py:open_code,
-    directly from auto_open, or from the Open button on a share card.
-    """
     if code is None:
         if not context.args:
             await _reply(update, "Usage: /open <code> [password]")
@@ -383,12 +354,11 @@ async def deliver_session(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     try:
         await _send_page(update, context, session, code, page=1)
     except Exception:
-        await _reply(update, "\u26A0\ufe0f Delivery failed. Please try again later.")
+        await _reply(update, "⚠️ Delivery failed. Please try again later.")
         raise
 
 
 def build_share_card(session: dict, bot_username: str):
-    """Card layout matching the reference bot: stats + a deep link + Open/Cancel buttons."""
     items = db.get_items(session["id"])
     code = session["code"]
     label = session["label"] or "Untitled"
@@ -397,19 +367,19 @@ def build_share_card(session: dict, bot_username: str):
     downloads_str = f"{session['downloads_used']}/{limit}" if limit else str(session["downloads_used"])
 
     text = (
-        f"\U0001F4E6 *{md(label)}*\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u25B8 Items \u2014 {len(items)}\n"
-        f"\u25B8 Expires \u2014 {expires}\n"
-        f"\u25B8 Downloads \u2014 {downloads_str}\n"
-        f"\u25B8 Code \u2014 {md(code)}\n"
-        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Open this share? \u2193"
+        f"📦 *{md(label)}*\n"
+        f"──────────\n"
+        f"▸ Items — {len(items)}\n"
+        f"▸ Expires — {expires}\n"
+        f"▸ Downloads — {downloads_str}\n"
+        f"▸ Code — {md(code)}\n"
+        f"▸ 🔗 t.me/{md(bot_username)}?start={md(code)}\n"
+        f"──────────\n"
+        f"Open this share? ↓"
     )
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("\U0001F4E7 Open", callback_data=f"open_share:{code}"),
-        InlineKeyboardButton("\u274C Cancel", callback_data="cancel_share"),
+        InlineKeyboardButton("📧 Open", callback_data=f"open_share:{code}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_share"),
     ]])
     return text, keyboard
 
@@ -426,7 +396,6 @@ async def send_share_card(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
 
 async def open_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when the Open button on a share card is tapped."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -434,36 +403,33 @@ async def open_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cancel_share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when the Cancel button on a share card is tapped."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Cancelled.")
 
 
 def build_management_card(session: dict, bot_username: str, saved: bool = False):
-    """Owner-facing card: Items/Code/Link + Open/Info/Share link/Edit/Delete.
-    Used by /create, /stop, /share, and My Cloud."""
     items = db.get_items(session["id"])
     code = session["code"]
     label = session["label"] or "Untitled"
-    header = f"\u2705 *{md(label)} saved*" if saved else f"\U0001F4E6 *{md(label)}*"
+    header = f"✅ *{md(label)} saved*" if saved else f"📦 *{md(label)}*"
 
     text = (
         f"{header}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"\u25B8 Items \u2014 {len(items)}\n"
-        f"\u25B8 Code \u2014 {md(code)}\n"
-        f"\u25B8 \U0001F517 t.me/{md(bot_username)}?start={md(code)}\n"
-        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Share the link, or manage it below \u2193"
+        f"──────────\n"
+        f"▸ Items — {len(items)}\n"
+        f"▸ Code — {md(code)}\n"
+        f"▸ 🔗 t.me/{md(bot_username)}?start={md(code)}\n"
+        f"──────────\n"
+        f"Share the link, or manage it below ↓"
     )
     share_url = f"https://t.me/share/url?url={quote(f'https://t.me/{bot_username}?start={code}')}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001F4C1 Open", callback_data=f"open_share:{code}"),
-         InlineKeyboardButton("\u2139\ufe0f Info", callback_data=f"card_info:{code}")],
-        [InlineKeyboardButton("\u2197\ufe0f Share link", url=share_url)],
-        [InlineKeyboardButton("\u270F\ufe0f Edit", callback_data=f"card_edit:{code}"),
-         InlineKeyboardButton("\U0001F5D1\ufe0f Delete", callback_data=f"card_delete:{code}")],
+        [InlineKeyboardButton("📁 Open", callback_data=f"open_share:{code}"),
+         InlineKeyboardButton("ℹ️ Info", callback_data=f"card_info:{code}")],
+        [InlineKeyboardButton("↗️ Share link", url=share_url)],
+        [InlineKeyboardButton("✏️ Edit", callback_data=f"card_edit:{code}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"card_delete:{code}")],
     ])
     return text, keyboard
 
@@ -482,7 +448,6 @@ async def send_management_card(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def card_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when a session row is tapped in My Cloud -- shows its management card."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -490,7 +455,6 @@ async def card_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Info is tapped on a management card -- shows full stats."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -505,7 +469,7 @@ async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     limit_str = f"{session['downloads_used']}/{limit}" if limit else "unlimited"
     lock_str = "yes" if session["password_hash"] else "no"
     await query.message.reply_text(
-        f"\u2139\ufe0f *Session Info*\n\n"
+        f"ℹ️ *Session Info*\n\n"
         f"Code: `{code}`\n"
         f"Label: {md(session['label']) if session['label'] else '(none)'}\n"
         f"Description: {md(session['description']) if session['description'] else '(none)'}\n"
@@ -520,7 +484,6 @@ async def card_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def card_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Edit is tapped -- reopens the session so more files can be added."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -534,7 +497,6 @@ async def card_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def card_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when Delete is tapped -- removes the session and its items."""
     query = update.callback_query
     await query.answer()
     code = query.data.split(":", 1)[1]
@@ -544,32 +506,31 @@ async def card_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Session not found.")
         return
     db.delete_session(owner_id, session["id"])
-    await query.edit_message_text(f"\U0001F5D1\ufe0f Deleted `{code}`.", parse_mode="Markdown")
+    await query.edit_message_text(f"🗑 Deleted `{code}`.", parse_mode="Markdown")
 
 
 async def cloud_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The 'My Cloud' screen -- tap a session to manage it, or go back to the menu."""
     owner_id = update.effective_user.id
     sessions = db.list_sessions(owner_id, limit=50)
 
     rows = []
     for s in sessions:
-        marker = "\U0001F7E2" if s["status"] == "open" else "\u26AA"
+        marker = "🟢" if s["status"] == "open" else "⚪"
         label = s["label"] or "Untitled"
         rows.append([InlineKeyboardButton(f"{marker} {label} ({s['code']})", callback_data=f"card_view:{s['code']}")])
-    rows.append([InlineKeyboardButton("\u25C0 Menu", callback_data="menu:root")])
+    rows.append([InlineKeyboardButton("◀ Menu", callback_data="menu:root")])
     keyboard = InlineKeyboardMarkup(rows)
 
     if not sessions:
         text = (
-            "\U0001F4C1 *My Cloud*\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
-            "Nothing here yet \u2014 tap \U0001F4E5 New Upload!"
+            "📁 *My Cloud*\n"
+            "──────────\n\n"
+            "Nothing here yet — tap 📥 New Upload!"
         )
     else:
         text = (
-            "\U0001F4C1 *My Cloud*\n"
-            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+            "📁 *My Cloud*\n"
+            "──────────\n\n"
             "Tap a session to manage it:"
         )
     await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
@@ -577,10 +538,6 @@ async def cloud_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/remove -- reply to a message the bot sent you (from an /open delivery)
-    to delete that item from its session. Matching is done by forwarded
-    vault message id, so this only works within the same chat where the
-    item was delivered."""
     message = update.message
     if not message.reply_to_message:
         await message.reply_text("Reply to a delivered item with /remove to delete it.")
@@ -602,38 +559,29 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     db.delete_item(item["id"])
-    await message.reply_text("\U0001F5D1\ufe0f Removed.")
+    await message.reply_text("🗑 Removed.")
 
-
-# ---------------------------------------------------------------------------
-# STUBS for features not implemented yet
-# ---------------------------------------------------------------------------
 
 @restricted
 async def zip_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stub for /zip <code>"""
-    await _reply(update, "\U0001F4E6 ZIP download is not implemented yet.")
+    await _reply(update, "📦 ZIP download is not implemented yet.")
 
 
 @restricted
 async def clean_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stub for /clean <code>"""
-    await _reply(update, "\U0001F5D1 Bulk item deletion is not implemented yet.")
+    await _reply(update, "🗑 Bulk item deletion is not implemented yet.")
 
 
 async def filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stub for filter:* inline buttons."""
     query = update.callback_query
     await query.answer("Filters are not implemented yet.")
 
 
 async def clean_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stub for clean_del:* inline buttons."""
     query = update.callback_query
     await query.answer("Bulk delete is not implemented yet.")
 
 
 async def clean_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stub for clean_page:* inline buttons."""
     query = update.callback_query
     await query.answer("Bulk delete is not implemented yet.")
