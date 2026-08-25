@@ -364,11 +364,15 @@ def main():
     # NOTE: Render free tier spins down after ~15 min of inactivity.
     # Use an external ping service (e.g. UptimeRobot) hitting https://file-codes.onrender.com/
     # every 10-14 minutes to keep this service alive.
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # ignore old updates queued while bot was asleep
-        poll_interval=1.0,           # be polite to Telegram servers
-    )
+    PORT = int(os.environ.get("PORT", 10000))
+WEBHOOK_URL = f"https://file-codes.onrender.com/{BOT_TOKEN}"
+
+app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    webhook_url=WEBHOOK_URL,
+    drop_pending_updates=True,
+)
 
 
 if __name__ == "__main__":
