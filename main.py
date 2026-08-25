@@ -3,7 +3,7 @@ import os
 import re
 import threading
 
-from flask import Flask
+
 from telegram import Update, BotCommand
 from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, Conflict
@@ -127,25 +127,18 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- keep-alive web server ----------
 
-@web_app.route("/")
-def root():
-    return "ok", 200
 
 
-@web_app.route("/healthz")
-def healthz():
-    return {"status": "ok"}, 200
 
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host="0.0.0.0", port=port)
+
+
 
 
 def main():
     db.init_db()
 
-    threading.Thread(target=run_web_server, daemon=True).start()
+    
 
     request = HTTPXRequest(
         connect_timeout=30,
