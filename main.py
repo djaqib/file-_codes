@@ -185,7 +185,7 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", session.create_cancel)],
-        per_message=True,  # suppresses PTB warning and properly tracks callback queries
+        per_message=True,
     )
     app.add_handler(create_conversation)
 
@@ -229,7 +229,14 @@ def main():
     app.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu:(cloud|profile|opencode|settings|help|root)$"))
 
     logger.info("Bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # NOTE: Render free tier spins down after ~15 min of inactivity.
+    # Use an external ping service (e.g. UptimeRobot) hitting https://file-codes.onrender.com/
+    # every 10-14 minutes to keep this service alive.
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # ignore old updates queued while bot was asleep
+        poll_interval=1.0,           # be polite to Telegram servers
+    )
 
 
 if __name__ == "__main__":
