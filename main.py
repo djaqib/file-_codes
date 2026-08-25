@@ -126,8 +126,6 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- keep-alive web server ----------
-web_app = Flask(__name__)
-
 
 @web_app.route("/")
 def root():
