@@ -26,12 +26,24 @@ def get_cursor(commit=False):
         yield cur
         if commit:
             conn.commit()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        # Connection is dead — don't try to rollback on it, just discard it.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _pool.putconn(conn, close=True)
+        raise
     except Exception:
         conn.rollback()
         raise
     finally:
-        cur.close()
-        _pool.putconn(conn)
+        try:
+            cur.close()
+        except Exception:
+            pass
+        if not conn.closed:
+            _pool.putconn(conn)
 
 
 def init_db():
