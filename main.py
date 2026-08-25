@@ -2,8 +2,6 @@ import logging
 import os
 import re
 import threading
-import signal
-import sys
 
 from flask import Flask
 from telegram import Update, BotCommand
@@ -84,20 +82,14 @@ async def post_init(app: Application):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors but don't crash on known non-fatal issues."""
     error = context.error
-
-    # Conflict = another instance is polling. Log quietly, don't spam.
     if isinstance(error, Conflict):
         logger.warning("Conflict: another bot instance is polling. This instance will back off.")
         return
-
     logger.error("Unhandled exception", exc_info=error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(
-                "⚠️ Something went wrong handling that. Check the Render logs for details."
-            )
+            await update.effective_message.reply_text("⚠️ Something went wrong. Check Render logs.")
         except Exception:
             pass
 
@@ -144,7 +136,6 @@ def root():
 
 @web_app.route("/healthz")
 def healthz():
-    """Render's health check + can also be used by UptimeRobot."""
     return {"status": "ok"}, 200
 
 
@@ -200,7 +191,11 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, session.create_receive_desc),
             ],
         },
-        fallbacks=[CommandHandler("cancel", session.create_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", session.create_cancel),
+            CommandHandler("create", session.create_start),
+            CommandHandler("start", session.create_cancel),
+        ],
         per_message=True,
     )
     app.add_handler(create_conversation)
@@ -244,21 +239,16 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(menu_router, pattern=r"^menu:(cloud|profile|opencode|settings|help|root)$"))
 
-    logger.info("Bot starting...")
+    logger.info("Bot starting with webhooks...")
 
-    # Graceful shutdown handler
-    def signal_handler(sig, frame):
-        logger.info("Shutdown signal received, stopping bot...")
-        app.stop()
-        sys.exit(0)
+    PORT = int(os.environ.get("PORT", 10000))
+    WEBHOOK_URL = f"https://file-codes.onrender.com/{BOT_TOKEN}"
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=WEBHOOK_URL,
         drop_pending_updates=True,
-        poll_interval=1.0,
     )
 
 
